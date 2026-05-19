@@ -109,10 +109,14 @@ public:
 
         // DATA
         if ((((h->frame_control) >> 2) & 63) == 2) {
-            print_ascii(frame + 24, frame_len - 24);
+            if (frame_len >= 24) {
+                print_ascii(frame + 24, frame_len - 24);
+            }
             // QoS Data
         } else if ((((h->frame_control) >> 2) & 63) == 34) {
-            print_ascii(frame + 26, frame_len - 26);
+            if (frame_len >= 26) {
+                print_ascii(frame + 26, frame_len - 26);
+            }
         }
 
         message_port_pub(pmt::mp("out"), pmt::cons(d_meta, d_msg));
