@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -74,6 +75,9 @@ void append_crc32_impl::handle(pmt::pmt_t msg)
     boost::crc_32_type result;
     result.process_bytes(data, len);
     uint32_t crc = result.checksum();
+
+    if(len > std::numeric_limits<size_t>::max() - sizeof(uint32_t))
+        throw std::length_error("append_crc32 payload too large");
 
     std::vector<uint8_t> out(len + sizeof(uint32_t));
     std::memcpy(out.data(), data, len);
