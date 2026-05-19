@@ -19,7 +19,9 @@
 
 #include <gnuradio/block_detail.h>
 #include <gnuradio/io_signature.h>
+#include <cstring>
 #include <string>
+#include <vector>
 
 using namespace gr::ieee802_11;
 
@@ -49,7 +51,12 @@ void ether_encap_impl::from_wifi(pmt::pmt_t msg)
 
     msg = pmt::cdr(msg);
 
-    int data_len = pmt::blob_length(msg);
+    const size_t data_len = pmt::blob_length(msg);
+    if (data_len < sizeof(mac_header)) {
+        dout << "Ether Encap: frame too short to parse" << std::endl;
+        return;
+    }
+
     const mac_header* mhdr = reinterpret_cast<const mac_header*>(pmt::blob_data(msg));
 
     if (d_last_seq == mhdr->seq_nr) {
@@ -59,48 +66,53 @@ void ether_encap_impl::from_wifi(pmt::pmt_t msg)
 
     d_last_seq = mhdr->seq_nr;
 
-
-    if (data_len < 33) {
-        dout << "Ether Encap: frame too short to parse (<33)" << std::endl;
-        return;
-    }
-
-    // this is more than needed
-    char* buf = static_cast<char*>(std::malloc(data_len + sizeof(ethernet_header)));
-    ethernet_header* ehdr = reinterpret_cast<ethernet_header*>(buf);
-
     if (((mhdr->frame_control >> 2) & 3) != 2) {
         dout << "this is not a data frame -- ignoring" << std::endl;
         return;
     }
 
-    std::memcpy(ehdr->dest, mhdr->addr1, 6);
-    std::memcpy(ehdr->src, mhdr->addr2, 6);
-    ehdr->type = 0x0008;
-
-    char* frame = (char*)pmt::blob_data(msg);
+    size_t payload_offset;
 
     // DATA
     if ((((mhdr->frame_control) >> 2) & 63) == 2) {
-        memcpy(buf + sizeof(ethernet_header), frame + 32, data_len - 32);
-        pmt::pmt_t payload = pmt::make_blob(buf, data_len - 32 + 14);
-        message_port_pub(pmt::mp("to tap"), pmt::cons(pmt::PMT_NIL, payload));
+        payload_offset = 32;
 
         // QoS Data
     } else if ((((mhdr->frame_control) >> 2) & 63) == 34) {
-
-        memcpy(buf + sizeof(ethernet_header), frame + 34, data_len - 34);
-        pmt::pmt_t payload = pmt::make_blob(buf, data_len - 34 + 14);
-        message_port_pub(pmt::mp("to tap"), pmt::cons(pmt::PMT_NIL, payload));
+        payload_offset = 34;
+    } else {
+        return;
     }
 
-    free(buf);
+    if (data_len < payload_offset) {
+        dout << "Ether Encap: data frame too short to decapsulate" << std::endl;
+        return;
+    }
+
+    const char* frame = static_cast<const char*>(pmt::blob_data(msg));
+    const size_t copy_len = data_len - payload_offset;
+    std::vector<char> buf(sizeof(ethernet_header) + copy_len);
+    ethernet_header* ehdr = reinterpret_cast<ethernet_header*>(buf.data());
+
+    std::memcpy(ehdr->dest, mhdr->addr1, 6);
+    std::memcpy(ehdr->src, mhdr->addr2, 6);
+    ehdr->type = 0x0008;
+    std::memcpy(buf.data() + sizeof(ethernet_header), frame + payload_offset, copy_len);
+
+    pmt::pmt_t payload = pmt::make_blob(buf.data(), buf.size());
+    message_port_pub(pmt::mp("to tap"), pmt::cons(pmt::PMT_NIL, payload));
 }
 
 void ether_encap_impl::from_tap(pmt::pmt_t msg)
 {
-    size_t len = pmt::blob_length(pmt::cdr(msg));
-    const char* data = static_cast<const char*>(pmt::blob_data(pmt::cdr(msg)));
+    pmt::pmt_t blob = pmt::cdr(msg);
+    size_t len = pmt::blob_length(blob);
+    const char* data = static_cast<const char*>(pmt::blob_data(blob));
+
+    if (len < sizeof(ethernet_header)) {
+        dout << "Ether Encap: Ethernet frame too short to parse" << std::endl;
+        return;
+    }
 
     const ethernet_header* ehdr = reinterpret_cast<const ethernet_header*>(data);
 
@@ -108,7 +120,8 @@ void ether_encap_impl::from_tap(pmt::pmt_t msg)
     case 0x0008: {
         std::cout << "ether type: IP" << std::endl;
 
-        char* buf = static_cast<char*>(malloc(len + 8 - sizeof(ethernet_header)));
+        const size_t payload_len = len - sizeof(ethernet_header);
+        std::vector<char> buf(8 + payload_len);
         buf[0] = 0xaa;
         buf[1] = 0xaa;
         buf[2] = 0x03;
@@ -117,10 +130,9 @@ void ether_encap_impl::from_tap(pmt::pmt_t msg)
         buf[5] = 0x00;
         buf[6] = 0x08;
         buf[7] = 0x00;
-        std::memcpy(
-            buf + 8, data + sizeof(ethernet_header), len - sizeof(ethernet_header));
-        pmt::pmt_t blob = pmt::make_blob(buf, len + 8 - sizeof(ethernet_header));
-        message_port_pub(pmt::mp("to wifi"), pmt::cons(pmt::PMT_NIL, blob));
+        std::memcpy(buf.data() + 8, data + sizeof(ethernet_header), payload_len);
+        pmt::pmt_t out_blob = pmt::make_blob(buf.data(), buf.size());
+        message_port_pub(pmt::mp("to wifi"), pmt::cons(pmt::PMT_NIL, out_blob));
         break;
     }
     case 0x0608:
