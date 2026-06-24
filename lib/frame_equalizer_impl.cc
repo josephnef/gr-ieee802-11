@@ -176,7 +176,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
 
         std::memcpy(current_symbol, in + i * fft, fft * sizeof(gr_complex));
 
-        // HT (Phase 1b): stash the *raw* FFT of the two symbols after L-SIG
+        // HT: stash the *raw* FFT of the two symbols after L-SIG
         // (candidate HT-SIG) before any legacy ramp/pilot correction mutates
         // current_symbol, and freeze the residual-CFO estimate as it stood at
         // L-SIG. The legacy pilot tracking corrupts d_er on QBPSK pilots, so the
@@ -248,9 +248,9 @@ int frame_equalizer_impl::general_work(int noutput_items,
         d_equalizer->equalize(
             current_symbol, d_current_symbol, symbols, out + o * 48, d_frame_mod);
 
-        // HT (Phase 1b): once both candidate HT-SIG symbols are stashed, decode
-        // them off the raw FFT (clean HT equalization). Diagnostic only for now --
-        // does not touch the legacy output flow.
+        // HT: once both candidate HT-SIG symbols are stashed, decode them off the
+        // raw FFT (clean HT equalization) and, on a valid CRC-8, start the HT/MIMO
+        // data decode. Runs alongside the untouched legacy 48-wide output flow.
         if (d_current_symbol == 4) {
             sniff_ht_sig();
         }
@@ -441,7 +441,7 @@ const int frame_equalizer_impl::interleaver_pattern[48] = {
     2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47
 };
 
-// ---- 802.11n HT-SIG decode over a clean HT equalization (Phase 1b) --------
+// ---- 802.11n HT-SIG decode over a clean HT equalization --------
 
 // HT-SIG CRC-8: G(x)=x^8+x^2+x+1 (0x07), register init all-ones, over the first
 // 34 HT-SIG bits, result is the bit-complement of the register (802.11 19.3.9.4.3).
@@ -551,7 +551,7 @@ bool frame_equalizer_impl::try_ht_sig(const gr_complex* eq,
 
 void frame_equalizer_impl::sniff_ht_sig()
 {
-    // PHY-format detection seam (Phase 4): symbols 3,4 after L-SIG carry HT-SIG
+    // PHY-format detection seam: symbols 3,4 after L-SIG carry HT-SIG
     // (QBPSK x2) for HT-mixed and VHT-SIG-A (BPSK then QBPSK) for VHT. We try HT-SIG
     // here (CRC-8 gate). A VHT branch would, on HT-SIG CRC failure, attempt
     // VHT-SIG-A decode and, on success, set d_format=FORMAT_VHT and dispatch to a
@@ -599,7 +599,7 @@ static bool ht40_is_data(int i)
 
 void frame_equalizer_impl::ht_begin(int mcs, int len)
 {
-    if (mcs > 7) { // SISO only for now (MCS 0..7 = 1 stream)
+    if (mcs > 7) { // single-stream path (MCS 0..7); MCS 8-15 go to mimo_begin
         return;
     }
     const int bw = (d_fft_len == 128) ? 40 : 20;

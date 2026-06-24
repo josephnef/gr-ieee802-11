@@ -43,8 +43,8 @@ enum Encoding {
     HT_MCS_18, HT_MCS_19, HT_MCS_20, HT_MCS_21, HT_MCS_22, HT_MCS_23,
     HT_MCS_24, HT_MCS_25, HT_MCS_26, HT_MCS_27, HT_MCS_28, HT_MCS_29,
     HT_MCS_30, HT_MCS_31 = 39,
-    // --- reserved for 802.11ac VHT (Phase 4 seam); not implemented yet. VHT signals
-    // (MCS, n_ss) separately, so 0..9 is the per-stream MCS range. ---
+    // --- reserved for 802.11ac VHT (extension seam); decode not implemented. VHT
+    // signals (MCS, n_ss) separately, so 0..9 is the per-stream MCS range. ---
     VHT_MCS_0 = 40, VHT_MCS_1, VHT_MCS_2, VHT_MCS_3, VHT_MCS_4,
     VHT_MCS_5, VHT_MCS_6, VHT_MCS_7, VHT_MCS_8, VHT_MCS_9 = 49,
 };

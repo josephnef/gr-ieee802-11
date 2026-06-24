@@ -82,7 +82,7 @@ public:
     int n_dbps;
 
     // --- format / geometry (legacy defaults set by the 1-arg constructor) ---
-    // format is the general seam (Phase 4): LEGACY/HT/VHT. is_ht is kept as a
+    // format is the general seam: LEGACY/HT/VHT. is_ht is kept as a
     // convenience alias (== format==FORMAT_HT) so existing call sites are unchanged;
     // VHT support sets format=FORMAT_VHT and reuses n_ss/bw/n_data_sc/fft_len.
     gr::ieee802_11::Format format = gr::ieee802_11::FORMAT_LEGACY;

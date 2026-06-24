@@ -54,7 +54,7 @@ private:
     bool decode_signal_field(uint8_t* rx_bits);
     void deinterleave(uint8_t* rx_bits);
 
-    // --- 802.11n HT (Phase 1a/b: HT-SIG sniffer over a clean HT equalization) ---
+    // --- 802.11n HT (HT-SIG sniffer over a clean HT equalization) ---
     // Decode the two captured QBPSK HT-SIG symbols; log MCS/length and CRC.
     void sniff_ht_sig();
     // Equalize one raw HT-SIG symbol (48 data carriers) with the L-LTF channel,
@@ -69,7 +69,7 @@ private:
     gr_complex d_ht_raw[2][128]; // raw FFT bins of the 2 candidate HT-SIG symbols
     double d_er_frozen;         // residual-CFO estimate frozen at L-SIG (pre HT-SIG)
 
-    // HT DATA decode (Phase 1b-ii). After HT-SIG validates we re-equalize the
+    // HT DATA decode. After HT-SIG validates we re-equalize the
     // HT DATA symbols (52 data SC for HT20) off the raw FFT, demap, deinterleave,
     // Viterbi-decode, descramble and CRC-32 check -- entirely inside this block
     // (the legacy 48-wide stream path to decode_mac is left untouched).
@@ -88,7 +88,7 @@ private:
     int d_ht_ndbps = 26; // data bits per HT OFDM symbol
     uint8_t d_ht_rx_bits[MAX_ENCODED_BITS]; // accumulated coded bits
 
-    // --- 802.11n 2x2 MIMO (Phase 3, MCS 8-15, HT20). Activated when n_rx==2 and
+    // --- 802.11n 2x2 MIMO (MCS 8-15, HT20). Activated when n_rx==2 and
     // HT-SIG reports MCS 8-15. The 2 HT-LTF symbols (P-matrix) give a per-subcarrier
     // 2x2 channel; data symbols are MMSE-separated into 2 streams, each demapped +
     // deinterleaved (3rd-permutation rotation), then stream-deparsed back to one BCC
