@@ -391,6 +391,8 @@ void viterbi_decoder::reset()
 {
 
     viterbi_chunks_init_generic();
+    d_store_pos = 0; // reset the traceback ring index (decoder reused across
+                     // L-SIG / HT-SIG / HT-DATA with different ntraceback)
 
     // Normalize the encoding to a coding rate. Legacy values map directly; HT
     // MCS share the same BCC code, so collapse them to {1/2, 2/3, 3/4, 5/6} by

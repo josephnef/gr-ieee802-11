@@ -434,25 +434,35 @@ void frame_equalizer_impl::equalize_ht_sig(const gr_complex* raw,
                                            const gr_complex* h,
                                            gr_complex* out48)
 {
-    int c = 0;
-    for (int i = 0; i < 64; i++) {
-        if ((i == 11) || (i == 25) || (i == 32) || (i == 39) || (i == 53) || (i < 6) ||
-            (i > 58)) {
-            continue;
-        }
-        // replicate the legacy sampling-offset ramp with the frozen d_er
+    // ramp + channel-equalize the 52 occupied bins (48 data + 4 pilots)
+    gr_complex eqd[64];
+    for (int i = 6; i <= 58; i++) {
         gr_complex r =
             raw[i] * exp(gr_complex(0,
                                     2 * M_PI * sym_idx * 80 *
                                         (d_epsilon0 + d_er_frozen) * (i - 32) / 64));
-        out48[c++] = r / h[i];
+        eqd[i] = r / h[i];
+    }
+    // Common-phase derotation from the 4 HT-SIG pilots {11,25,39,53}, which are
+    // QBPSK {+1,+1,+1,-1}*Pn*j. Using the known pilots (not a blind square)
+    // resolves the phase unambiguously and is robust to sync-alignment jitter --
+    // and the pilots' own j cancels the data's QBPSK rotation, landing data on
+    // the real axis. (Same scheme as the HT DATA path.)
+    gr_complex p = equalizer::base::POLARITY[(sym_idx - 2) % 127];
+    gr_complex acc = eqd[11] * p + eqd[25] * p + eqd[39] * p + eqd[53] * (-p);
+    gr_complex derot = std::polar(1.0f, (float)(-std::arg(acc)));
+    int c = 0;
+    for (int i = 6; i <= 58; i++) {
+        if (i == 11 || i == 25 || i == 32 || i == 39 || i == 53) {
+            continue;
+        }
+        out48[c++] = eqd[i] * derot;
     }
 }
 
 // Decode the two equalized HT-SIG symbols at the given per-symbol derotation
 // phases. Returns true (and fills out params) on valid CRC-8 + sane fields.
 bool frame_equalizer_impl::try_ht_sig(const gr_complex* eq,
-                                      const double* phi,
                                       int& mcs,
                                       int& cbw,
                                       int& len,
@@ -462,10 +472,9 @@ bool frame_equalizer_impl::try_ht_sig(const gr_complex* eq,
 {
     uint8_t coded[96];
     for (int s = 0; s < 2; s++) {
-        gr_complex rot = std::polar(1.0f, (float)(-phi[s]));
         uint8_t raw[48];
         for (int c = 0; c < 48; c++) {
-            raw[c] = std::real(eq[s * 48 + c] * rot) > 0 ? 1 : 0;
+            raw[c] = std::real(eq[s * 48 + c]) > 0 ? 1 : 0; // pilot-derotated
         }
         for (int i = 0; i < 48; i++) {
             coded[s * 48 + i] = raw[interleaver_pattern[i]];
@@ -507,39 +516,18 @@ void frame_equalizer_impl::sniff_ht_sig()
 {
     const gr_complex* h = d_equalizer->get_h();
 
-    // Clean HT equalization of the two raw candidate symbols (indices 3,4).
+    // Pilot-derotated HT equalization of the two candidate symbols (3,4).
     gr_complex eq[96];
     equalize_ht_sig(d_ht_raw[0], 3, h, eq);
     equalize_ht_sig(d_ht_raw[1], 4, h, eq + 48);
 
-    // HT-SIG is QBPSK. Blind-estimate each symbol's axis by squaring (removes the
-    // +/-1 modulation -> 2*axis): phi = 0.5*arg(sum sym^2). The square has a
-    // 180-degree ambiguity, so try both resolutions per symbol (4 combinations)
-    // and accept the one whose HT-SIG CRC-8 passes.
-    double base[2];
-    for (int s = 0; s < 2; s++) {
-        gr_complex acc(0, 0);
-        for (int c = 0; c < 48; c++) {
-            acc += eq[s * 48 + c] * eq[s * 48 + c];
-        }
-        base[s] = 0.5 * std::arg(acc);
-    }
-
-    int mcs = -1, cbw = 0, len = 0, stbc = 0, fec = 0, sgi = 0;
-    for (int a = 0; a < 2; a++) {
-        for (int b = 0; b < 2; b++) {
-            double phi[2] = { base[0] + a * M_PI, base[1] + b * M_PI };
-            if (try_ht_sig(eq, phi, mcs, cbw, len, stbc, fec, sgi)) {
-                std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
-                          << " len=" << len << " stbc=" << stbc
-                          << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi
-                          << std::endl;
-                // Drive the HT DATA decoder for SISO 20 MHz BCC.
-                if (cbw == 0 && stbc == 0 && fec == 0) {
-                    ht_begin(mcs, len);
-                }
-                return;
-            }
+    int mcs, cbw, len, stbc, fec, sgi;
+    if (try_ht_sig(eq, mcs, cbw, len, stbc, fec, sgi)) {
+        std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
+                  << " len=" << len << " stbc=" << stbc
+                  << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi << std::endl;
+        if (cbw == 0 && stbc == 0 && fec == 0) { // SISO 20 MHz BCC -> decode data
+            ht_begin(mcs, len);
         }
     }
 }

@@ -310,6 +310,9 @@ void viterbi_decoder::reset()
 {
 
     viterbi_chunks_init_sse2();
+    d_store_pos = 0; // reset the traceback ring index -- this decoder instance is
+                     // reused for L-SIG / HT-SIG / HT-DATA with different
+                     // ntraceback; a stale d_store_pos corrupts the next decode.
 
     // Normalize the encoding to a coding rate (legacy maps directly; HT MCS share
     // the same BCC code -> collapse by per-stream MCS-mod-8). Mirrors the generic
