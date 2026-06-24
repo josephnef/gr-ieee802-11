@@ -514,10 +514,10 @@ void frame_equalizer_impl::sniff_ht_sig()
         base[s] = 0.5 * std::arg(acc);
     }
 
+    int mcs = -1, cbw = 0, len = 0, stbc = 0, fec = 0, sgi = 0;
     for (int a = 0; a < 2; a++) {
         for (int b = 0; b < 2; b++) {
             double phi[2] = { base[0] + a * M_PI, base[1] + b * M_PI };
-            int mcs, cbw, len, stbc, fec, sgi;
             if (try_ht_sig(eq, phi, mcs, cbw, len, stbc, fec, sgi)) {
                 std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
                           << " len=" << len << " stbc=" << stbc
