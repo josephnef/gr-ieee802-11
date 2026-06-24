@@ -38,16 +38,17 @@ class sync_long_impl : public sync_long
 {
 
 public:
-    sync_long_impl(unsigned int sync_length, bool log, bool debug)
+    sync_long_impl(unsigned int sync_length, bool log, bool debug, int fft_len)
         : block("sync_long",
                 gr::io_signature::make2(2, 2, sizeof(gr_complex), sizeof(gr_complex)),
                 gr::io_signature::make(1, 1, sizeof(gr_complex))),
-          d_fir(gr::filter::kernel::fir_filter_ccc(LONG)),
+          d_fir(gr::filter::kernel::fir_filter_ccc(fft_len == 128 ? LONG128 : LONG)),
           d_log(log),
           d_debug(debug),
           d_offset(0),
           d_state(SYNC),
-          SYNC_LENGTH(sync_length)
+          SYNC_LENGTH(sync_length),
+          d_fft_len(fft_len)
     {
 
         set_tag_propagation_policy(block::TPP_DONT);
@@ -100,10 +101,11 @@ public:
         switch (d_state) {
 
         case SYNC:
-            d_fir.filterN(
-                d_correlation, in, std::min(SYNC_LENGTH, std::max(ninput - 63, 0)));
+            d_fir.filterN(d_correlation,
+                          in,
+                          std::min(SYNC_LENGTH, std::max(ninput - (d_fft_len - 1), 0)));
 
-            while (i + 63 < ninput) {
+            while (i + (d_fft_len - 1) < ninput) {
 
                 d_cor.push_back(pair<gr_complex, int>(d_correlation[i], d_offset));
 
@@ -136,7 +138,9 @@ public:
                                  pmt::string_to_symbol(name()));
                 }
 
-                if (rel >= 0 && (rel < 128 || ((rel - 128) % 80) > 15)) {
+                if (rel >= 0 && (rel < 2 * d_fft_len ||
+                                 ((rel - 2 * d_fft_len) % (d_fft_len + d_fft_len / 4)) >
+                                     (d_fft_len / 4 - 1))) {
                     out[o] = in_delayed[i] * exp(gr_complex(0, d_offset * d_freq_offset));
                     o++;
                 }
@@ -149,7 +153,7 @@ public:
 
         case RESET: {
             while (o < noutput) {
-                if (((d_count + o) % 64) == 0) {
+                if (((d_count + o) % d_fft_len) == 0) {
                     d_offset = 0;
                     d_state = SYNC;
                     break;
@@ -177,8 +181,8 @@ public:
         // in sync state we need at least a symbol to correlate
         // with the pattern
         if (d_state == SYNC) {
-            ninput_items_required[0] = 64;
-            ninput_items_required[1] = 64;
+            ninput_items_required[0] = d_fft_len;
+            ninput_items_required[1] = d_fft_len;
 
         } else {
             ninput_items_required[0] = noutput_items;
@@ -212,18 +216,18 @@ public:
                     second = get<0>(vec[k]);
                 }
                 int diff = abs(get<1>(vec[i]) - get<1>(vec[k]));
-                if (diff == 64) {
+                if (diff == d_fft_len) {
                     d_frame_start = min(get<1>(vec[i]), get<1>(vec[k]));
-                    d_freq_offset = arg(first * conj(second)) / 64;
+                    d_freq_offset = arg(first * conj(second)) / d_fft_len;
                     // nice match found, return immediately
                     return;
 
-                } else if (diff == 63) {
+                } else if (diff == d_fft_len - 1) {
                     d_frame_start = min(get<1>(vec[i]), get<1>(vec[k]));
-                    d_freq_offset = arg(first * conj(second)) / 63;
-                } else if (diff == 65) {
+                    d_freq_offset = arg(first * conj(second)) / (d_fft_len - 1);
+                } else if (diff == d_fft_len + 1) {
                     d_frame_start = min(get<1>(vec[i]), get<1>(vec[k]));
-                    d_freq_offset = arg(first * conj(second)) / 65;
+                    d_freq_offset = arg(first * conj(second)) / (d_fft_len + 1);
                 }
             }
         }
@@ -245,13 +249,16 @@ private:
     const bool d_log;
     const bool d_debug;
     const int SYNC_LENGTH;
+    const int d_fft_len; // 64 (=20 MHz) or 128 (=HT40); selects matched filter & geometry
 
     static const std::vector<gr_complex> LONG;
+    static const std::vector<gr_complex> LONG128; // HT40 non-HT-duplicate L-LTF (128 taps)
 };
 
-sync_long::sptr sync_long::make(unsigned int sync_length, bool log, bool debug)
+sync_long::sptr sync_long::make(unsigned int sync_length, bool log, bool debug, int fft_len)
 {
-    return gnuradio::get_initial_sptr(new sync_long_impl(sync_length, log, debug));
+    return gnuradio::get_initial_sptr(
+        new sync_long_impl(sync_length, log, debug, fft_len));
 }
 
 const std::vector<gr_complex> sync_long_impl::LONG = {
@@ -287,4 +294,75 @@ const std::vector<gr_complex> sync_long_impl::LONG = {
     gr_complex(0.5309, 0.7784),   gr_complex(0.1874, -0.2475),
     gr_complex(0.8594, -0.7348),  gr_complex(0.3528, 0.9865),
     gr_complex(-0.0455, 1.0679),  gr_complex(1.3868, -0.0000),
+};
+
+// HT40 non-HT-duplicate L-LTF matched filter (128 taps): conj(ifft(ifftshift(LONG40)))
+// reversed, scaled to ~unit mean magnitude. The two identical L-LTF40 symbols are 128
+// samples apart, so search_frame_start's diff==fft_len pair test locates the frame.
+// Generated by tools_gen_wifi.py's LONG40 (must stay in sync with equalizer base.cc).
+const std::vector<gr_complex> sync_long_impl::LONG128 = {
+    gr_complex(0.1796, -0.7441),  gr_complex(0.5906, 0.5424),
+    gr_complex(0.8547, 0.5615),   gr_complex(-0.3362, -0.7105),
+    gr_complex(0.4657, -0.5642),  gr_complex(-0.8457, 0.0661),
+    gr_complex(-0.6344, -0.2760), gr_complex(0.2307, 0.0319),
+    gr_complex(-0.0009, -0.5236), gr_complex(0.1313, 0.6946),
+    gr_complex(0.4104, 0.2438),   gr_complex(-0.8018, 0.2823),
+    gr_complex(-0.9659, 0.2358),  gr_complex(0.6803, 0.3195),
+    gr_complex(0.1189, 0.7220),   gr_complex(0.3373, -0.5811),
+    gr_complex(0.4593, -0.2389),  gr_complex(-0.2703, 0.2319),
+    gr_complex(0.1048, 0.5188),   gr_complex(-0.5368, -0.5461),
+    gr_complex(-0.8527, -0.0677), gr_complex(0.8672, -0.4210),
+    gr_complex(0.5619, -0.2812),  gr_complex(-0.1603, -0.3908),
+    gr_complex(0.0930, -0.7858),  gr_complex(-0.2059, 0.3466),
+    gr_complex(-0.3772, -0.5152), gr_complex(0.6505, 0.8622),
+    gr_complex(0.7777, 0.3055),   gr_complex(-0.5421, 0.5807),
+    gr_complex(-0.1322, 0.9487),  gr_complex(0.0000, -0.5885),
+    gr_complex(0.3014, -0.0055),  gr_complex(-0.6368, -0.2892),
+    gr_complex(-0.4980, -0.3262), gr_complex(-0.0843, 0.4544),
+    gr_complex(-0.5157, 0.7617),  gr_complex(0.3109, -0.9251),
+    gr_complex(-0.3447, -0.6402), gr_complex(0.8219, 0.0477),
+    gr_complex(0.7609, -0.3670),  gr_complex(-0.3940, 0.2610),
+    gr_complex(-0.1470, -0.2379), gr_complex(0.0988, 0.6666),
+    gr_complex(-0.0196, 0.6406),  gr_complex(0.3684, -0.1631),
+    gr_complex(0.7490, 0.3858),   gr_complex(-0.8754, -0.5454),
+    gr_complex(-0.7558, -0.1494), gr_complex(0.6518, -0.4959),
+    gr_complex(0.6931, -0.8242),  gr_complex(-0.6960, 0.5029),
+    gr_complex(-0.4357, -0.2215), gr_complex(-0.0049, 0.7020),
+    gr_complex(-0.2912, 0.4827),  gr_complex(0.2400, 0.2664),
+    gr_complex(0.0570, 0.9154),   gr_complex(-0.1094, -0.9746),
+    gr_complex(-0.5001, -0.5225), gr_complex(0.9303, 0.0666),
+    gr_complex(0.9835, 0.0335),   gr_complex(-0.5173, -0.4017),
+    gr_complex(0.2070, -0.7718),  gr_complex(-0.7356, 0.7356),
+    gr_complex(-0.7718, 0.2070),  gr_complex(0.4017, 0.5173),
+    gr_complex(0.0335, 0.9835),   gr_complex(-0.0666, -0.9303),
+    gr_complex(-0.5225, -0.5001), gr_complex(0.9746, 0.1094),
+    gr_complex(0.9154, 0.0570),   gr_complex(-0.2664, -0.2400),
+    gr_complex(0.4827, -0.2912),  gr_complex(-0.7020, 0.0049),
+    gr_complex(-0.2215, -0.4357), gr_complex(-0.5029, 0.6960),
+    gr_complex(-0.8242, 0.6931),  gr_complex(0.4959, -0.6518),
+    gr_complex(-0.1494, -0.7558), gr_complex(0.5454, 0.8754),
+    gr_complex(0.3858, 0.7490),   gr_complex(0.1631, -0.3684),
+    gr_complex(0.6406, -0.0196),  gr_complex(-0.6666, -0.0988),
+    gr_complex(-0.2379, -0.1470), gr_complex(-0.2610, 0.3940),
+    gr_complex(-0.3670, 0.7609),  gr_complex(-0.0477, -0.8219),
+    gr_complex(-0.6402, -0.3447), gr_complex(0.9251, -0.3109),
+    gr_complex(0.7617, -0.5157),  gr_complex(-0.4544, 0.0843),
+    gr_complex(-0.3262, -0.4980), gr_complex(0.2892, 0.6368),
+    gr_complex(-0.0055, 0.3014),  gr_complex(0.5885, 0.0000),
+    gr_complex(0.9487, -0.1322),  gr_complex(-0.5807, 0.5421),
+    gr_complex(0.3055, 0.7777),   gr_complex(-0.8622, -0.6505),
+    gr_complex(-0.5152, -0.3772), gr_complex(-0.3466, 0.2059),
+    gr_complex(-0.7858, 0.0930),  gr_complex(0.3908, 0.1603),
+    gr_complex(-0.2812, 0.5619),  gr_complex(0.4210, -0.8672),
+    gr_complex(-0.0677, -0.8527), gr_complex(0.5461, 0.5368),
+    gr_complex(0.5188, 0.1048),   gr_complex(-0.2319, 0.2703),
+    gr_complex(-0.2389, 0.4593),  gr_complex(0.5811, -0.3373),
+    gr_complex(0.7220, 0.1189),   gr_complex(-0.3195, -0.6803),
+    gr_complex(0.2358, -0.9659),  gr_complex(-0.2823, 0.8018),
+    gr_complex(0.2438, 0.4104),   gr_complex(-0.6946, -0.1313),
+    gr_complex(-0.5236, -0.0009), gr_complex(-0.0319, -0.2307),
+    gr_complex(-0.2760, -0.6344), gr_complex(-0.0661, 0.8457),
+    gr_complex(-0.5642, 0.4657),  gr_complex(0.7105, 0.3362),
+    gr_complex(0.5615, 0.8547),   gr_complex(-0.5424, -0.5906),
+    gr_complex(-0.7441, 0.1796),  gr_complex(0.7356, -0.7356),
 };

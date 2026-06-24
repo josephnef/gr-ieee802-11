@@ -14,7 +14,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(0)                                                       */
 /* BINDTOOL_USE_PYGCCXML(0)                                                        */
 /* BINDTOOL_HEADER_FILE(sync_long.h)                                        */
-/* BINDTOOL_HEADER_FILE_HASH(a0194fa153fe85f65ac2b217646c1d12)                     */
+/* BINDTOOL_HEADER_FILE_HASH(ad1aa6d44b9b160eb372fbcf759e29f4)                     */
 /***********************************************************************************/
 
 #include <pybind11/complex.h>
@@ -40,6 +40,7 @@ void bind_sync_long(py::module& m)
            py::arg("sync_length"),
            py::arg("log") = false,
            py::arg("debug") = false,
+           py::arg("fft_len") = 64,
            D(sync_long,make)
         )
         

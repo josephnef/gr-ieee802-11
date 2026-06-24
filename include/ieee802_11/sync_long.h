@@ -27,7 +27,8 @@ class IEEE802_11_API sync_long : virtual public block
 {
 public:
     typedef std::shared_ptr<sync_long> sptr;
-    static sptr make(unsigned int sync_length, bool log = false, bool debug = false);
+    static sptr
+    make(unsigned int sync_length, bool log = false, bool debug = false, int fft_len = 64);
 };
 
 } // namespace ieee802_11

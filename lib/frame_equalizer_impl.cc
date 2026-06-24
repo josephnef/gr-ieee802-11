@@ -540,7 +540,9 @@ void frame_equalizer_impl::sniff_ht_sig()
         std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
                   << " len=" << len << " stbc=" << stbc
                   << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi << std::endl;
-        if (cbw == 0 && stbc == 0 && fec == 0) { // SISO 20 MHz BCC -> decode data
+        // SISO BCC, bandwidth matching this block's FFT (HT20 cbw=0 / HT40 cbw=1).
+        const int want_cbw = (d_fft_len == 128) ? 1 : 0;
+        if (cbw == want_cbw && stbc == 0 && fec == 0) {
             ht_begin(mcs, len);
         }
     }
