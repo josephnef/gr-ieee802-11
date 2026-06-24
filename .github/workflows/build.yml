@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [feat/ht-vht-rx]
+  pull_request:
+  workflow_dispatch:
+
+# Build-only smoke for the modern-OFDM (HT/HT40/2x2-MIMO) receive fork: compile
+# against GNU Radio 3.10 and confirm the Python module imports. End-to-end decode
+# is validated downstream in the sdr2wifi harness.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GNU Radio 3.10 + build deps
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            gnuradio gnuradio-dev cmake build-essential git ca-certificates \
+            python3 python3-dev pybind11-dev libvolk-dev libboost-all-dev liborc-0.4-dev
+
+      - name: Configure + build + install
+        run: |
+          cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/opt/grwifi \
+            -DCMAKE_PREFIX_PATH=/opt/grwifi -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(nproc)"
+          cmake --install build
+
+      - name: Import smoke test
+        run: |
+          OOT=$(find /opt/grwifi -name ieee802_11 -type d -path '*packages*' | head -1)
+          export PYTHONPATH="${OOT%/ieee802_11}"
+          export LD_LIBRARY_PATH=/opt/grwifi/lib:/opt/grwifi/lib64
+          python3 -c "import ieee802_11; print('ieee802_11 OK')"
