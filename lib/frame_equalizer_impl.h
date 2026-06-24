@@ -48,6 +48,14 @@ private:
     bool decode_signal_field(uint8_t* rx_bits);
     void deinterleave(uint8_t* rx_bits);
 
+    // --- 802.11n HT (Phase 1a: observational HT-SIG sniffer) ---
+    // Capture the equalized constellation of an OFDM symbol into an HT-SIG slot.
+    void capture_ht_sig(int slot, const gr_complex* eq_symbols);
+    // Decode the two captured QBPSK HT-SIG symbols; log MCS/length and CRC.
+    void sniff_ht_sig();
+
+    gr_complex d_ht_sig_syms[2][48]; // equalized HT-SIG candidate symbols (3,4)
+
     equalizer::base* d_equalizer;
     gr::thread::mutex d_mutex;
     std::vector<gr::tag_t> tags;

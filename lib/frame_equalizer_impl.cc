@@ -218,6 +218,16 @@ int frame_equalizer_impl::general_work(int noutput_items,
         d_equalizer->equalize(
             current_symbol, d_current_symbol, symbols, out + o * 48, d_frame_mod);
 
+        // HT (Phase 1a): observe the two symbols right after L-SIG as candidate
+        // HT-SIG (QBPSK). Purely diagnostic -- does not touch the legacy output
+        // flow; HT frames still fall through the legacy path and get dropped.
+        if (d_current_symbol == 3) {
+            capture_ht_sig(0, symbols);
+        } else if (d_current_symbol == 4) {
+            capture_ht_sig(1, symbols);
+            sniff_ht_sig();
+        }
+
         // signal field
         if (d_current_symbol == 2) {
 
@@ -377,6 +387,102 @@ const int frame_equalizer_impl::interleaver_pattern[48] = {
     1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 37, 40, 43, 46,
     2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47
 };
+
+// ---- 802.11n HT-SIG sniffer (Phase 1a, observational) --------------------
+
+void frame_equalizer_impl::capture_ht_sig(int slot, const gr_complex* eq_symbols)
+{
+    std::memcpy(d_ht_sig_syms[slot], eq_symbols, 48 * sizeof(gr_complex));
+}
+
+// HT-SIG CRC-8: G(x)=x^8+x^2+x+1 (0x07), register init all-ones, over the first
+// 34 HT-SIG bits, result is the bit-complement of the register (802.11 19.3.9.4.3).
+static uint8_t ht_sig_crc8(const uint8_t* bits, int n)
+{
+    uint8_t c = 0xff;
+    for (int i = 0; i < n; i++) {
+        uint8_t fb = (bits[i] & 1) ^ ((c >> 7) & 1);
+        c = (uint8_t)(c << 1);
+        if (fb) {
+            c ^= 0x07;
+        }
+    }
+    return (uint8_t)(~c);
+}
+
+void frame_equalizer_impl::sniff_ht_sig()
+{
+    // Constellation orientation: HT-SIG is QBPSK. After the legacy pilot/residual
+    // -CFO tracking the symbols are usually rotated near one axis; decide on the
+    // dominant-energy axis so we are robust to that rotation.
+    double re = 0, im = 0;
+    for (int s = 0; s < 2; s++) {
+        for (int c = 0; c < 48; c++) {
+            re += std::norm(gr_complex(std::real(d_ht_sig_syms[s][c]), 0));
+            im += std::norm(gr_complex(std::imag(d_ht_sig_syms[s][c]), 0));
+        }
+    }
+    const bool use_imag = im > re;
+
+    // Two BPSK(QBPSK) symbols -> 96 coded bits, legacy 48-bit deinterleaver each.
+    uint8_t coded[96];
+    for (int s = 0; s < 2; s++) {
+        uint8_t raw[48];
+        for (int c = 0; c < 48; c++) {
+            double v = use_imag ? std::imag(d_ht_sig_syms[s][c])
+                                : std::real(d_ht_sig_syms[s][c]);
+            raw[c] = v > 0 ? 1 : 0;
+        }
+        for (int i = 0; i < 48; i++) {
+            coded[s * 48 + i] = raw[interleaver_pattern[i]];
+        }
+    }
+
+    // Viterbi decode 96 -> 48 info bits (BPSK rate 1/2 over 2 OFDM symbols).
+    static ofdm_param ofdm(BPSK_1_2);
+    static frame_param frame(ofdm, 0);
+    frame.n_sym = 2;
+    frame.n_data_bits = 48;
+    frame.n_encoded_bits = 96;
+    frame.psdu_size = 0;
+    frame.n_pad = 0;
+    uint8_t* bits = d_decoder.decode(&ofdm, &frame, coded);
+
+    int mcs = 0;
+    for (int i = 0; i < 7; i++) {
+        mcs |= bits[i] << i;
+    }
+    int cbw = bits[7];
+    int len = 0;
+    for (int i = 0; i < 16; i++) {
+        len |= bits[8 + i] << i;
+    }
+    int stbc = bits[28] | (bits[29] << 1);
+    int fec = bits[30];
+    int sgi = bits[31];
+
+    uint8_t crc_calc = ht_sig_crc8(bits, 34);
+    int crc_msb = 0;
+    for (int i = 0; i < 8; i++) {
+        crc_msb |= bits[34 + i] << (7 - i); // CRC transmitted MSB-first (c7..c0)
+    }
+    // A real HT-SIG must have a valid CRC AND self-consistent fields (HT MCS is
+    // 0..31 for <=4 streams; HT-Length is the MPDU/A-MPDU octet count). This
+    // rejects the ~1/256 random CRC hits and ambient VHT misreads.
+    const bool ok =
+        (crc_calc == crc_msb) && mcs <= 31 && len >= 1 && len <= 4095 && fec == 0;
+
+    if (ok) {
+        std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
+                  << " len=" << len << " stbc=" << stbc << " fec=" << (fec ? "LDPC" : "BCC")
+                  << " sgi=" << sgi << " axis=" << (use_imag ? "imag" : "real")
+                  << std::endl;
+    } else {
+        dout << "[HT-SIG] reject mcs=" << mcs << " len=" << len
+             << " crc " << (crc_calc == crc_msb ? "ok" : "bad")
+             << " axis=" << (use_imag ? "imag" : "real") << std::endl;
+    }
+}
 
 } /* namespace ieee802_11 */
 } /* namespace gr */
