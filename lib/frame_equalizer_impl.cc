@@ -158,6 +158,18 @@ int frame_equalizer_impl::general_work(int noutput_items,
 
         std::memcpy(current_symbol, in + i * 64, 64 * sizeof(gr_complex));
 
+        // HT (Phase 1b): stash the *raw* FFT of the two symbols after L-SIG
+        // (candidate HT-SIG) before any legacy ramp/pilot correction mutates
+        // current_symbol, and freeze the residual-CFO estimate as it stood at
+        // L-SIG. The legacy pilot tracking corrupts d_er on QBPSK pilots, so the
+        // HT path re-equalizes these raw symbols itself (see sniff_ht_sig).
+        if (d_current_symbol == 3) {
+            d_er_frozen = d_er;
+            std::memcpy(d_ht_raw[0], in + i * 64, 64 * sizeof(gr_complex));
+        } else if (d_current_symbol == 4) {
+            std::memcpy(d_ht_raw[1], in + i * 64, 64 * sizeof(gr_complex));
+        }
+
         // compensate sampling offset
         for (int i = 0; i < 64; i++) {
             current_symbol[i] *= exp(gr_complex(0,
@@ -218,13 +230,10 @@ int frame_equalizer_impl::general_work(int noutput_items,
         d_equalizer->equalize(
             current_symbol, d_current_symbol, symbols, out + o * 48, d_frame_mod);
 
-        // HT (Phase 1a): observe the two symbols right after L-SIG as candidate
-        // HT-SIG (QBPSK). Purely diagnostic -- does not touch the legacy output
-        // flow; HT frames still fall through the legacy path and get dropped.
-        if (d_current_symbol == 3) {
-            capture_ht_sig(0, symbols);
-        } else if (d_current_symbol == 4) {
-            capture_ht_sig(1, symbols);
+        // HT (Phase 1b): once both candidate HT-SIG symbols are stashed, decode
+        // them off the raw FFT (clean HT equalization). Diagnostic only for now --
+        // does not touch the legacy output flow.
+        if (d_current_symbol == 4) {
             sniff_ht_sig();
         }
 
@@ -388,12 +397,7 @@ const int frame_equalizer_impl::interleaver_pattern[48] = {
     2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47
 };
 
-// ---- 802.11n HT-SIG sniffer (Phase 1a, observational) --------------------
-
-void frame_equalizer_impl::capture_ht_sig(int slot, const gr_complex* eq_symbols)
-{
-    std::memcpy(d_ht_sig_syms[slot], eq_symbols, 48 * sizeof(gr_complex));
-}
+// ---- 802.11n HT-SIG decode over a clean HT equalization (Phase 1b) --------
 
 // HT-SIG CRC-8: G(x)=x^8+x^2+x+1 (0x07), register init all-ones, over the first
 // 34 HT-SIG bits, result is the bit-complement of the register (802.11 19.3.9.4.3).
@@ -410,28 +414,47 @@ static uint8_t ht_sig_crc8(const uint8_t* bits, int n)
     return (uint8_t)(~c);
 }
 
-void frame_equalizer_impl::sniff_ht_sig()
+// HT-SIG occupies the same 52 subcarriers as L-SIG: 48 data + 4 pilots
+// {11,25,39,53}; the same legacy 48-bit interleaver applies. Equalize the raw
+// FFT of an HT-SIG symbol (index sym_idx) with the L-LTF channel `h` and the
+// frozen sampling-offset correction, returning the 48 data-carrier symbols.
+void frame_equalizer_impl::equalize_ht_sig(const gr_complex* raw,
+                                           int sym_idx,
+                                           const gr_complex* h,
+                                           gr_complex* out48)
 {
-    // Constellation orientation: HT-SIG is QBPSK. After the legacy pilot/residual
-    // -CFO tracking the symbols are usually rotated near one axis; decide on the
-    // dominant-energy axis so we are robust to that rotation.
-    double re = 0, im = 0;
-    for (int s = 0; s < 2; s++) {
-        for (int c = 0; c < 48; c++) {
-            re += std::norm(gr_complex(std::real(d_ht_sig_syms[s][c]), 0));
-            im += std::norm(gr_complex(std::imag(d_ht_sig_syms[s][c]), 0));
+    int c = 0;
+    for (int i = 0; i < 64; i++) {
+        if ((i == 11) || (i == 25) || (i == 32) || (i == 39) || (i == 53) || (i < 6) ||
+            (i > 58)) {
+            continue;
         }
+        // replicate the legacy sampling-offset ramp with the frozen d_er
+        gr_complex r =
+            raw[i] * exp(gr_complex(0,
+                                    2 * M_PI * sym_idx * 80 *
+                                        (d_epsilon0 + d_er_frozen) * (i - 32) / 64));
+        out48[c++] = r / h[i];
     }
-    const bool use_imag = im > re;
+}
 
-    // Two BPSK(QBPSK) symbols -> 96 coded bits, legacy 48-bit deinterleaver each.
+// Decode the two equalized HT-SIG symbols at the given per-symbol derotation
+// phases. Returns true (and fills out params) on valid CRC-8 + sane fields.
+bool frame_equalizer_impl::try_ht_sig(const gr_complex* eq,
+                                      const double* phi,
+                                      int& mcs,
+                                      int& cbw,
+                                      int& len,
+                                      int& stbc,
+                                      int& fec,
+                                      int& sgi)
+{
     uint8_t coded[96];
     for (int s = 0; s < 2; s++) {
+        gr_complex rot = std::polar(1.0f, (float)(-phi[s]));
         uint8_t raw[48];
         for (int c = 0; c < 48; c++) {
-            double v = use_imag ? std::imag(d_ht_sig_syms[s][c])
-                                : std::real(d_ht_sig_syms[s][c]);
-            raw[c] = v > 0 ? 1 : 0;
+            raw[c] = std::real(eq[s * 48 + c] * rot) > 0 ? 1 : 0;
         }
         for (int i = 0; i < 48; i++) {
             coded[s * 48 + i] = raw[interleaver_pattern[i]];
@@ -448,39 +471,61 @@ void frame_equalizer_impl::sniff_ht_sig()
     frame.n_pad = 0;
     uint8_t* bits = d_decoder.decode(&ofdm, &frame, coded);
 
-    int mcs = 0;
+    mcs = 0;
     for (int i = 0; i < 7; i++) {
         mcs |= bits[i] << i;
     }
-    int cbw = bits[7];
-    int len = 0;
+    cbw = bits[7];
+    len = 0;
     for (int i = 0; i < 16; i++) {
         len |= bits[8 + i] << i;
     }
-    int stbc = bits[28] | (bits[29] << 1);
-    int fec = bits[30];
-    int sgi = bits[31];
+    stbc = bits[28] | (bits[29] << 1);
+    fec = bits[30];
+    sgi = bits[31];
 
     uint8_t crc_calc = ht_sig_crc8(bits, 34);
     int crc_msb = 0;
     for (int i = 0; i < 8; i++) {
         crc_msb |= bits[34 + i] << (7 - i); // CRC transmitted MSB-first (c7..c0)
     }
-    // A real HT-SIG must have a valid CRC AND self-consistent fields (HT MCS is
-    // 0..31 for <=4 streams; HT-Length is the MPDU/A-MPDU octet count). This
-    // rejects the ~1/256 random CRC hits and ambient VHT misreads.
-    const bool ok =
-        (crc_calc == crc_msb) && mcs <= 31 && len >= 1 && len <= 4095 && fec == 0;
+    return (crc_calc == crc_msb) && mcs <= 31 && len >= 1 && len <= 4095 && fec == 0;
+}
 
-    if (ok) {
-        std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
-                  << " len=" << len << " stbc=" << stbc << " fec=" << (fec ? "LDPC" : "BCC")
-                  << " sgi=" << sgi << " axis=" << (use_imag ? "imag" : "real")
-                  << std::endl;
-    } else {
-        dout << "[HT-SIG] reject mcs=" << mcs << " len=" << len
-             << " crc " << (crc_calc == crc_msb ? "ok" : "bad")
-             << " axis=" << (use_imag ? "imag" : "real") << std::endl;
+void frame_equalizer_impl::sniff_ht_sig()
+{
+    const gr_complex* h = d_equalizer->get_h();
+
+    // Clean HT equalization of the two raw candidate symbols (indices 3,4).
+    gr_complex eq[96];
+    equalize_ht_sig(d_ht_raw[0], 3, h, eq);
+    equalize_ht_sig(d_ht_raw[1], 4, h, eq + 48);
+
+    // HT-SIG is QBPSK. Blind-estimate each symbol's axis by squaring (removes the
+    // +/-1 modulation -> 2*axis): phi = 0.5*arg(sum sym^2). The square has a
+    // 180-degree ambiguity, so try both resolutions per symbol (4 combinations)
+    // and accept the one whose HT-SIG CRC-8 passes.
+    double base[2];
+    for (int s = 0; s < 2; s++) {
+        gr_complex acc(0, 0);
+        for (int c = 0; c < 48; c++) {
+            acc += eq[s * 48 + c] * eq[s * 48 + c];
+        }
+        base[s] = 0.5 * std::arg(acc);
+    }
+
+    for (int a = 0; a < 2; a++) {
+        for (int b = 0; b < 2; b++) {
+            double phi[2] = { base[0] + a * M_PI, base[1] + b * M_PI };
+            int mcs, cbw, len, stbc, fec, sgi;
+            if (try_ht_sig(eq, phi, mcs, cbw, len, stbc, fec, sgi)) {
+                std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
+                          << " len=" << len << " stbc=" << stbc
+                          << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi
+                          << std::endl;
+                return;
+            }
+        }
     }
 }
 

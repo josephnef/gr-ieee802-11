@@ -48,13 +48,19 @@ private:
     bool decode_signal_field(uint8_t* rx_bits);
     void deinterleave(uint8_t* rx_bits);
 
-    // --- 802.11n HT (Phase 1a: observational HT-SIG sniffer) ---
-    // Capture the equalized constellation of an OFDM symbol into an HT-SIG slot.
-    void capture_ht_sig(int slot, const gr_complex* eq_symbols);
+    // --- 802.11n HT (Phase 1a/b: HT-SIG sniffer over a clean HT equalization) ---
     // Decode the two captured QBPSK HT-SIG symbols; log MCS/length and CRC.
     void sniff_ht_sig();
+    // Equalize one raw HT-SIG symbol (48 data carriers) with the L-LTF channel.
+    void equalize_ht_sig(const gr_complex* raw, int sym_idx, const gr_complex* h,
+                         gr_complex* out48);
+    // Attempt an HT-SIG decode of the two equalized symbols (flat 96 = 2x48) at
+    // the given per-symbol phases.
+    bool try_ht_sig(const gr_complex* eq, const double* phi, int& mcs, int& cbw,
+                    int& len, int& stbc, int& fec, int& sgi);
 
-    gr_complex d_ht_sig_syms[2][48]; // equalized HT-SIG candidate symbols (3,4)
+    gr_complex d_ht_raw[2][64]; // raw FFT bins of the 2 candidate HT-SIG symbols
+    double d_er_frozen;         // residual-CFO estimate frozen at L-SIG (pre HT-SIG)
 
     equalizer::base* d_equalizer;
     gr::thread::mutex d_mutex;

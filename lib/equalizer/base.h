@@ -40,6 +40,10 @@ public:
 
     std::vector<gr_complex> get_csi();
 
+    // L-LTF channel estimate (64 FFT bins). Valid after the 2 LTF symbols; used
+    // by the HT path to equalize HT-SIG/HT data without the legacy pilot tracking.
+    const gr_complex* get_h() const { return d_H; }
+
 protected:
     static const gr_complex LONG[64];
 
