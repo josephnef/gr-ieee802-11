@@ -38,6 +38,7 @@ public:
 
     static const gr_complex POLARITY[127];
     static const gr_complex HTLTF40[128]; // HT40 HT-LTF (all 114 occupied bins)
+    static const gr_complex HTLTF20[64];  // HT20 HT-LTF (L-LTF + edge tones 4,5,59,60)
 
     std::vector<gr_complex> get_csi();
 

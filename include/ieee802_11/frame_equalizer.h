@@ -41,8 +41,15 @@ public:
     typedef std::shared_ptr<frame_equalizer> sptr;
     // fft_len: 64 (20 MHz, default) or 128 (HT40). 128 enables the HT 40 MHz
     // receive path; the legacy/HT20 paths are unchanged at 64.
-    static sptr
-    make(Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len = 64);
+    // n_rx: 1 (default) or 2 receive antennas. 2 enables the 802.11n 2x2 MIMO
+    // receive path (MCS 8-15); the block then takes 2 input streams.
+    static sptr make(Equalizer algo,
+                     double freq,
+                     double bw,
+                     bool log,
+                     bool debug,
+                     int fft_len = 64,
+                     int n_rx = 1);
     virtual void set_algorithm(Equalizer algo) = 0;
     virtual void set_bandwidth(double bw) = 0;
     virtual void set_frequency(double freq) = 0;

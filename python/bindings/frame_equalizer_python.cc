@@ -14,7 +14,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(0)                                                       */
 /* BINDTOOL_USE_PYGCCXML(0)                                                        */
 /* BINDTOOL_HEADER_FILE(frame_equalizer.h)                                        */
-/* BINDTOOL_HEADER_FILE_HASH(e7a0ca42329e54b9b25f6a50c0bafcb5)                     */
+/* BINDTOOL_HEADER_FILE_HASH(2ae3115c3b7b2da80c1372a2ada507cc)                     */
 /***********************************************************************************/
 
 #include <pybind11/complex.h>
@@ -43,6 +43,7 @@ void bind_frame_equalizer(py::module& m)
            py::arg("log"),
            py::arg("debug"),
            py::arg("fft_len") = 64,
+           py::arg("n_rx") = 1,
            D(frame_equalizer,make)
         )
         

@@ -30,8 +30,13 @@ class frame_equalizer_impl : virtual public frame_equalizer
 {
 
 public:
-    frame_equalizer_impl(
-        Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len);
+    frame_equalizer_impl(Equalizer algo,
+                         double freq,
+                         double bw,
+                         bool log,
+                         bool debug,
+                         int fft_len,
+                         int n_rx);
     ~frame_equalizer_impl();
 
     void set_algorithm(Equalizer algo);
@@ -82,6 +87,22 @@ private:
     int d_ht_ncbps = 52; // coded bits per HT OFDM symbol
     int d_ht_ndbps = 26; // data bits per HT OFDM symbol
     uint8_t d_ht_rx_bits[MAX_ENCODED_BITS]; // accumulated coded bits
+
+    // --- 802.11n 2x2 MIMO (Phase 3, MCS 8-15, HT20). Activated when n_rx==2 and
+    // HT-SIG reports MCS 8-15. The 2 HT-LTF symbols (P-matrix) give a per-subcarrier
+    // 2x2 channel; data symbols are MMSE-separated into 2 streams, each demapped +
+    // deinterleaved (3rd-permutation rotation), then stream-deparsed back to one BCC
+    // sequence, Viterbi-decoded, descrambled and CRC-32 checked inside this block.
+    int d_n_rx;                  // 1 (SISO) or 2 (MIMO RX antennas)
+    bool d_mimo_active = false;
+    gr_complex d_mimo_ltf[2][2][64]; // [ltf_sym 0..1][rx_ant 0..1][bin] raw HT-LTF FFT
+    int d_mimo_ltf_seen = 0;
+    gr_complex d_mimo_H[64][2][2];   // per-subcarrier 2x2 channel [sc][rx][stream]
+    uint8_t d_mimo_bits[2][MAX_ENCODED_BITS]; // per-stream demapped coded bits (SC order)
+    void mimo_begin(int mcs, int len);
+    void mimo_estimate_ltf();
+    void mimo_data_symbol(const gr_complex* r0, const gr_complex* r1, int sym_idx);
+    void mimo_finish();
 
     equalizer::base* d_equalizer;
     gr::thread::mutex d_mutex;

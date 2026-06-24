@@ -30,17 +30,17 @@ namespace gr {
 namespace ieee802_11 {
 
 frame_equalizer::sptr frame_equalizer::make(
-    Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len)
+    Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len, int n_rx)
 {
     return gnuradio::get_initial_sptr(
-        new frame_equalizer_impl(algo, freq, bw, log, debug, fft_len));
+        new frame_equalizer_impl(algo, freq, bw, log, debug, fft_len, n_rx));
 }
 
 
 frame_equalizer_impl::frame_equalizer_impl(
-    Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len)
+    Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len, int n_rx)
     : gr::block("frame_equalizer",
-                gr::io_signature::make(1, 1, fft_len * sizeof(gr_complex)),
+                gr::io_signature::make(n_rx, n_rx, fft_len * sizeof(gr_complex)),
                 gr::io_signature::make(1, 1, 48)),
       d_current_symbol(0),
       d_log(log),
@@ -51,7 +51,8 @@ frame_equalizer_impl::frame_equalizer_impl(
       d_fft_len(fft_len),
       d_frame_bytes(0),
       d_frame_symbols(0),
-      d_freq_offset_from_synclong(0.0)
+      d_freq_offset_from_synclong(0.0),
+      d_n_rx(n_rx)
 {
 
     message_port_register_out(pmt::mp("symbols"));
@@ -115,6 +116,9 @@ void frame_equalizer_impl::forecast(int noutput_items,
                                     gr_vector_int& ninput_items_required)
 {
     ninput_items_required[0] = noutput_items;
+    if (d_n_rx == 2) {
+        ninput_items_required[1] = noutput_items;
+    }
 }
 
 int frame_equalizer_impl::general_work(int noutput_items,
@@ -126,6 +130,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
     gr::thread::scoped_lock lock(d_mutex);
 
     const gr_complex* in = (const gr_complex*)input_items[0];
+    const gr_complex* in1 = (d_n_rx == 2) ? (const gr_complex*)input_items[1] : nullptr;
     uint8_t* out = (uint8_t*)output_items[0];
 
     int i = 0;
@@ -160,10 +165,11 @@ int frame_equalizer_impl::general_work(int noutput_items,
         // new frame resets the HT decode state
         if (tags.size()) {
             d_ht_active = false;
+            d_mimo_active = false;
         }
 
-        // not interesting -> skip (but keep going while an HT frame is decoding)
-        if (d_current_symbol > (d_frame_symbols + 2) && !d_ht_active) {
+        // not interesting -> skip (but keep going while an HT/MIMO frame is decoding)
+        if (d_current_symbol > (d_frame_symbols + 2) && !d_ht_active && !d_mimo_active) {
             i++;
             continue;
         }
@@ -258,6 +264,20 @@ int frame_equalizer_impl::general_work(int noutput_items,
             ht_data_symbol(in + i * fft, d_current_symbol);
         }
 
+        // 2x2 MIMO (MCS 8-15): 2 HT-LTF symbols (6,7) give the 2x2 channel; HT DATA
+        // starts at symbol 8. Both RX antennas are read off the 2 input streams.
+        if (d_mimo_active && (d_current_symbol == 6 || d_current_symbol == 7)) {
+            int t = d_current_symbol - 6;
+            std::memcpy(d_mimo_ltf[t][0], in + i * fft, 64 * sizeof(gr_complex));
+            std::memcpy(d_mimo_ltf[t][1], in1 + i * fft, 64 * sizeof(gr_complex));
+            if (++d_mimo_ltf_seen == 2) {
+                mimo_estimate_ltf();
+            }
+        }
+        if (d_mimo_active && d_current_symbol >= 8) {
+            mimo_data_symbol(in + i * fft, in1 + i * fft, d_current_symbol);
+        }
+
         // signal field
         if (d_current_symbol == 2) {
 
@@ -306,6 +326,9 @@ int frame_equalizer_impl::general_work(int noutput_items,
     }
 
     consume(0, i);
+    if (d_n_rx == 2) {
+        consume(1, i);
+    }
     return o;
 }
 
@@ -540,6 +563,11 @@ void frame_equalizer_impl::sniff_ht_sig()
         std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
                   << " len=" << len << " stbc=" << stbc
                   << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi << std::endl;
+        // 2x2 MIMO (MCS 8-15, HT20, BCC) when 2 RX antennas are wired.
+        if (d_n_rx == 2 && mcs >= 8 && mcs <= 15 && cbw == 0 && stbc == 0 && fec == 0) {
+            mimo_begin(mcs, len);
+            return;
+        }
         // SISO BCC, bandwidth matching this block's FFT (HT20 cbw=0 / HT40 cbw=1).
         const int want_cbw = (d_fft_len == 128) ? 1 : 0;
         if (cbw == want_cbw && stbc == 0 && fec == 0) {
@@ -715,6 +743,171 @@ void frame_equalizer_impl::ht_finish()
     crc.process_bytes(out_bytes + 2, d_ht_len);
     bool ok = (crc.checksum() == 558161692);
     std::cout << "[HT-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
+              << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
+              << std::endl;
+}
+
+// ---- 802.11n 2x2 MIMO (MCS 8-15, HT20) ----------------------------------------
+
+void frame_equalizer_impl::mimo_begin(int mcs, int len)
+{
+    const int per = mcs - 8; // per-stream MCS (8->0 .. 15->7)
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + per), 20);
+    const int ndbps_tot = 2 * ofdm.n_dbps;
+    const int nsym = (int)ceil((16 + 8 * len + 6) / (double)ndbps_tot);
+    if (nsym <= 0 || nsym > MAX_SYM)
+        return;
+    if (nsym * 2 * ofdm.n_cbps > MAX_ENCODED_BITS)
+        return;
+    d_mimo_active = true;
+    d_mimo_ltf_seen = 0;
+    d_ht_mcs = per; // store per-stream values; *2 for totals at finish
+    d_ht_len = len;
+    d_ht_nsym = nsym;
+    d_ht_dsym = 0;
+    d_ht_nbpsc = ofdm.n_bpsc;
+    d_ht_ncbps = ofdm.n_cbps; // per-stream coded bits / symbol (N_CBPSS)
+    d_ht_ndbps = ofdm.n_dbps;
+}
+
+// Per-subcarrier 2x2 channel from the 2 HT-LTF symbols (P-matrix). With
+// P=[[1,-1],[1,1]], P^-1 = 0.5*[[1,1],[-1,1]]:  [H_r0;H_r1] = P^-1 [y_r0;y_r1]/LTF.
+void frame_equalizer_impl::mimo_estimate_ltf()
+{
+    const int dc = 32, slen = 80;
+    for (int sc = 4; sc <= 60; sc++) {
+        gr_complex ref = equalizer::base::HTLTF20[sc];
+        if (ref == gr_complex(0, 0))
+            continue;
+        for (int r = 0; r < 2; r++) {
+            gr_complex y0 = d_mimo_ltf[0][r][sc], y1 = d_mimo_ltf[1][r][sc];
+            // sampling-offset deramp at the LTF symbol positions (6,7)
+            y0 *= exp(gr_complex(
+                0, 2 * M_PI * 6 * slen * (d_epsilon0 + d_er_frozen) * (sc - dc) / 64));
+            y1 *= exp(gr_complex(
+                0, 2 * M_PI * 7 * slen * (d_epsilon0 + d_er_frozen) * (sc - dc) / 64));
+            d_mimo_H[sc][r][0] = gr_complex(0.5f, 0) * (y0 + y1) / ref;
+            d_mimo_H[sc][r][1] = gr_complex(0.5f, 0) * (y1 - y0) / ref;
+        }
+    }
+}
+
+// MMSE-separate one HT DATA symbol into 2 streams, demap each, store coded bits.
+void frame_equalizer_impl::mimo_data_symbol(const gr_complex* r0,
+                                            const gr_complex* r1,
+                                            int sym_idx)
+{
+    const int dc = 32, slen = 80;
+    const int dsym = sym_idx - 8; // 0-based HT DATA symbol index
+    const float s2 = 1e-3f;       // MMSE noise floor (near-ZF for clean signal)
+
+    std::shared_ptr<gr::digital::constellation> mod = d_64qam;
+    if (d_ht_nbpsc == 1)
+        mod = d_bpsk;
+    else if (d_ht_nbpsc == 2)
+        mod = d_qpsk;
+    else if (d_ht_nbpsc == 4)
+        mod = d_16qam;
+
+    int c[2] = { dsym * d_ht_ncbps, dsym * d_ht_ncbps };
+    for (int sc = 4; sc <= 60; sc++) {
+        if (!ht20_is_data(sc))
+            continue;
+        gr_complex ramp = exp(gr_complex(
+            0, 2 * M_PI * sym_idx * slen * (d_epsilon0 + d_er_frozen) * (sc - dc) / 64));
+        gr_complex y0 = r0[sc] * ramp, y1 = r1[sc] * ramp;
+        gr_complex H00 = d_mimo_H[sc][0][0], H01 = d_mimo_H[sc][0][1];
+        gr_complex H10 = d_mimo_H[sc][1][0], H11 = d_mimo_H[sc][1][1];
+        // MMSE: x = (H^H H + s2 I)^-1 H^H y
+        gr_complex G00 = std::norm(H00) + std::norm(H10) + s2;
+        gr_complex G11 = std::norm(H01) + std::norm(H11) + s2;
+        gr_complex G01 = conj(H00) * H01 + conj(H10) * H11;
+        gr_complex G10 = conj(H01) * H00 + conj(H11) * H10;
+        gr_complex b0 = conj(H00) * y0 + conj(H10) * y1;
+        gr_complex b1 = conj(H01) * y0 + conj(H11) * y1;
+        gr_complex det = G00 * G11 - G01 * G10;
+        gr_complex x0 = (G11 * b0 - G01 * b1) / det;
+        gr_complex x1 = (-G10 * b0 + G00 * b1) / det;
+        gr_complex xs[2] = { x0, x1 };
+        for (int ss = 0; ss < 2; ss++) {
+            gr_complex sym = xs[ss];
+            unsigned int val = mod->decision_maker(&sym);
+            for (int k = 0; k < d_ht_nbpsc; k++) {
+                d_mimo_bits[ss][c[ss] + k] = (val >> k) & 1;
+            }
+            c[ss] += d_ht_nbpsc;
+        }
+    }
+    d_ht_dsym++;
+    if (d_ht_dsym >= d_ht_nsym) {
+        mimo_finish();
+        d_mimo_active = false;
+    }
+}
+
+void frame_equalizer_impl::mimo_finish()
+{
+    const int ncbps = d_ht_ncbps; // per-stream
+    const int s = std::max(d_ht_nbpsc / 2, 1);
+    const int n_col = 13;
+    const int n_row = 4 * d_ht_nbpsc;
+    const int n_rot = 11;
+
+    // per-stream deinterleave (with the 3rd-permutation rotation for stream>0)
+    static uint8_t deint[2][MAX_ENCODED_BITS];
+    for (int ss = 0; ss < 2; ss++) {
+        const int issp = ss + 1;
+        const int jrot =
+            (((issp - 1) * 2) % 3 + 3 * ((issp - 1) / 3)) * n_rot * d_ht_nbpsc;
+        for (int sym = 0; sym < d_ht_nsym; sym++) {
+            for (int k = 0; k < ncbps; k++) {
+                int ii = n_row * (k % n_col) + (k / n_col);
+                int j = s * (ii / s) + (ii + ncbps - (n_col * ii) / ncbps) % s;
+                int r = ((j - jrot) % ncbps + ncbps) % ncbps; // forward k -> position
+                deint[ss][sym * ncbps + k] = d_mimo_bits[ss][sym * ncbps + r];
+            }
+        }
+    }
+
+    // stream de-parse: s bits at a time, round-robin from the 2 streams -> one BCC seq
+    static uint8_t deparsed[MAX_ENCODED_BITS];
+    int pos[2] = { 0, 0 }, idx = 0;
+    const int blocks_per_sym = (2 * ncbps) / s;
+    for (int sym = 0; sym < d_ht_nsym; sym++) {
+        for (int blk = 0; blk < blocks_per_sym; blk++) {
+            int ss = blk % 2;
+            for (int b = 0; b < s; b++) {
+                deparsed[idx++] = deint[ss][pos[ss]++];
+            }
+        }
+    }
+
+    // single Viterbi decode over the combined stream (n_cbps/n_dbps doubled)
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + d_ht_mcs), 20);
+    ofdm.n_cbps *= 2;
+    ofdm.n_dbps *= 2;
+    frame_param frame(ofdm, d_ht_len);
+    uint8_t* decoded = d_decoder.decode(&ofdm, &frame, deparsed);
+
+    int state = 0;
+    static uint8_t out_bytes[MAX_PSDU_SIZE + 2];
+    std::memset(out_bytes, 0, d_ht_len + 2);
+    for (int i = 0; i < 7; i++) {
+        if (decoded[i])
+            state |= 1 << (6 - i);
+    }
+    out_bytes[0] = state;
+    for (int i = 7; i < d_ht_len * 8 + 16; i++) {
+        int fb = (!!(state & 64)) ^ (!!(state & 8));
+        int bit = fb ^ (decoded[i] & 0x1);
+        out_bytes[i / 8] |= bit << (i % 8);
+        state = ((state << 1) & 0x7e) | fb;
+    }
+
+    boost::crc_32_type crc;
+    crc.process_bytes(out_bytes + 2, d_ht_len);
+    bool ok = (crc.checksum() == 558161692);
+    std::cout << "[HT-MIMO] mcs=" << (d_ht_mcs + 8) << " (2x2) len=" << d_ht_len
               << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
               << std::endl;
 }
