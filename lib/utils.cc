@@ -99,7 +99,9 @@ ofdm_param::ofdm_param(Encoding e)
 ofdm_param::ofdm_param(Encoding e, int bw_mhz)
 {
     encoding = e;
+    format = gr::ieee802_11::FORMAT_HT;
     is_ht = true;
+    fec_type = gr::ieee802_11::FEC_BCC;
     bw = bw_mhz;
     assert(e >= gr::ieee802_11::HT_MCS_0 && e <= gr::ieee802_11::HT_MCS_31);
 

@@ -43,14 +43,27 @@ enum Encoding {
     HT_MCS_18, HT_MCS_19, HT_MCS_20, HT_MCS_21, HT_MCS_22, HT_MCS_23,
     HT_MCS_24, HT_MCS_25, HT_MCS_26, HT_MCS_27, HT_MCS_28, HT_MCS_29,
     HT_MCS_30, HT_MCS_31 = 39,
-    // --- reserved for 802.11ac VHT (Phase 4); not implemented yet ---
-    VHT_MCS_0 = 40,
+    // --- reserved for 802.11ac VHT (Phase 4 seam); not implemented yet. VHT signals
+    // (MCS, n_ss) separately, so 0..9 is the per-stream MCS range. ---
+    VHT_MCS_0 = 40, VHT_MCS_1, VHT_MCS_2, VHT_MCS_3, VHT_MCS_4,
+    VHT_MCS_5, VHT_MCS_6, VHT_MCS_7, VHT_MCS_8, VHT_MCS_9 = 49,
 };
+
+// PHY format. The RX detects this just after L-SIG (HT-SIG QBPSK rotation -> HT;
+// VHT-SIG-A BPSK-then-QBPSK -> VHT), so it is a per-frame property, not wired in.
+enum Format { FORMAT_LEGACY = 0, FORMAT_HT = 1, FORMAT_VHT = 2 };
+
+// Forward error correction. BCC (Viterbi) today; LDPC is the VHT/HT optional seam.
+enum FecType { FEC_BCC = 0, FEC_LDPC = 1 };
 
 // True for the HT MCS range (HT_MCS_0..HT_MCS_31).
 inline bool is_ht_encoding(Encoding e) { return e >= HT_MCS_0 && e <= HT_MCS_31; }
+// True for the VHT MCS range (VHT_MCS_0..VHT_MCS_9).
+inline bool is_vht_encoding(Encoding e) { return e >= VHT_MCS_0 && e <= VHT_MCS_9; }
 // HT MCS index 0..31 for an HT encoding (undefined for legacy).
 inline int ht_mcs_index(Encoding e) { return static_cast<int>(e) - HT_MCS_0; }
+// VHT MCS index 0..9 for a VHT encoding (undefined otherwise).
+inline int vht_mcs_index(Encoding e) { return static_cast<int>(e) - VHT_MCS_0; }
 
 // Required for fmt 10
 inline uint8_t format_as(Encoding e) {

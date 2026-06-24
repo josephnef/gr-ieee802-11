@@ -551,6 +551,13 @@ bool frame_equalizer_impl::try_ht_sig(const gr_complex* eq,
 
 void frame_equalizer_impl::sniff_ht_sig()
 {
+    // PHY-format detection seam (Phase 4): symbols 3,4 after L-SIG carry HT-SIG
+    // (QBPSK x2) for HT-mixed and VHT-SIG-A (BPSK then QBPSK) for VHT. We try HT-SIG
+    // here (CRC-8 gate). A VHT branch would, on HT-SIG CRC failure, attempt
+    // VHT-SIG-A decode and, on success, set d_format=FORMAT_VHT and dispatch to a
+    // vht_begin() parallel to ht_begin()/mimo_begin(). The 2x2 channel machinery
+    // (mimo_estimate_ltf / MMSE / stream de-parse) is format-agnostic and reused for
+    // VHT-LTF; only the SIG parse, subcarrier geometry and LDPC FEC differ.
     const gr_complex* h = d_equalizer->get_h();
 
     // Pilot-derotated HT equalization of the two candidate symbols (3,4).

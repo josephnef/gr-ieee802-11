@@ -82,12 +82,17 @@ public:
     int n_dbps;
 
     // --- format / geometry (legacy defaults set by the 1-arg constructor) ---
-    bool is_ht = false;     // true for HT_MCS_*
+    // format is the general seam (Phase 4): LEGACY/HT/VHT. is_ht is kept as a
+    // convenience alias (== format==FORMAT_HT) so existing call sites are unchanged;
+    // VHT support sets format=FORMAT_VHT and reuses n_ss/bw/n_data_sc/fft_len.
+    gr::ieee802_11::Format format = gr::ieee802_11::FORMAT_LEGACY;
+    gr::ieee802_11::FecType fec_type = gr::ieee802_11::FEC_BCC; // LDPC drops in here
+    bool is_ht = false;     // true for HT_MCS_* (alias of format==FORMAT_HT)
     int n_ss = 1;           // spatial streams
-    int bw = 20;            // channel bandwidth in MHz (20 or 40)
+    int bw = 20;            // channel bandwidth in MHz (20, 40; VHT adds 80/160)
     int n_data_sc = 48;     // data subcarriers (legacy 48, HT20 52, HT40 108)
     int n_pilot_sc = 4;     // pilot subcarriers (legacy/HT20 4, HT40 6)
-    int fft_len = 64;       // OFDM FFT size (20 MHz 64, 40 MHz 128)
+    int fft_len = 64;       // OFDM FFT size (20 MHz 64, 40 MHz 128; VHT80 256)
 
     void print();
 };
