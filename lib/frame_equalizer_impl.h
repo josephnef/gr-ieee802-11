@@ -62,6 +62,23 @@ private:
     gr_complex d_ht_raw[2][64]; // raw FFT bins of the 2 candidate HT-SIG symbols
     double d_er_frozen;         // residual-CFO estimate frozen at L-SIG (pre HT-SIG)
 
+    // HT DATA decode (Phase 1b-ii). After HT-SIG validates we re-equalize the
+    // HT DATA symbols (52 data SC for HT20) off the raw FFT, demap, deinterleave,
+    // Viterbi-decode, descramble and CRC-32 check -- entirely inside this block
+    // (the legacy 48-wide stream path to decode_mac is left untouched).
+    void ht_begin(int mcs, int len);
+    void ht_data_symbol(const gr_complex* raw, int sym_idx);
+    void ht_finish();
+    bool d_ht_active = false;
+    int d_ht_mcs = 0;
+    int d_ht_len = 0;
+    int d_ht_nsym = 0;   // number of HT DATA OFDM symbols
+    int d_ht_dsym = 0;   // HT DATA symbols collected so far
+    int d_ht_nbpsc = 1;  // bits per subcarrier for the HT MCS
+    int d_ht_ncbps = 52; // coded bits per HT OFDM symbol
+    int d_ht_ndbps = 26; // data bits per HT OFDM symbol
+    uint8_t d_ht_rx_bits[MAX_ENCODED_BITS]; // accumulated coded bits
+
     equalizer::base* d_equalizer;
     gr::thread::mutex d_mutex;
     std::vector<gr::tag_t> tags;

@@ -23,6 +23,8 @@
 #include "frame_equalizer_impl.h"
 #include "utils.h"
 #include <gnuradio/io_signature.h>
+#include <boost/crc.hpp>
+#include <vector>
 
 namespace gr {
 namespace ieee802_11 {
@@ -150,8 +152,13 @@ int frame_equalizer_impl::general_work(int noutput_items,
             dout << "epsilon: " << d_epsilon0 << std::endl;
         }
 
-        // not interesting -> skip
-        if (d_current_symbol > (d_frame_symbols + 2)) {
+        // new frame resets the HT decode state
+        if (tags.size()) {
+            d_ht_active = false;
+        }
+
+        // not interesting -> skip (but keep going while an HT frame is decoding)
+        if (d_current_symbol > (d_frame_symbols + 2) && !d_ht_active) {
             i++;
             continue;
         }
@@ -235,6 +242,10 @@ int frame_equalizer_impl::general_work(int noutput_items,
         // does not touch the legacy output flow.
         if (d_current_symbol == 4) {
             sniff_ht_sig();
+        }
+        // HT DATA symbols start after L-SIG(2), HT-SIG(3,4), HT-STF(5), HT-LTF(6).
+        if (d_ht_active && d_current_symbol >= 7) {
+            ht_data_symbol(in + i * 64, d_current_symbol);
         }
 
         // signal field
@@ -523,10 +534,146 @@ void frame_equalizer_impl::sniff_ht_sig()
                           << " len=" << len << " stbc=" << stbc
                           << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi
                           << std::endl;
+                // Drive the HT DATA decoder for SISO 20 MHz BCC.
+                if (cbw == 0 && stbc == 0 && fec == 0) {
+                    ht_begin(mcs, len);
+                }
                 return;
             }
         }
     }
+}
+
+// HT20 data subcarriers: FFT bins 4..60 excluding DC(32) and pilots
+// {11,25,39,53} -> 52 carriers in ascending-frequency (logical SC) order.
+static bool ht20_is_data(int i)
+{
+    return i >= 4 && i <= 60 && i != 32 && i != 11 && i != 25 && i != 39 && i != 53;
+}
+
+void frame_equalizer_impl::ht_begin(int mcs, int len)
+{
+    if (mcs > 7) { // SISO only for now (MCS 0..7 = 1 stream)
+        return;
+    }
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + mcs), 20);
+    frame_param frame(ofdm, len);
+    if (frame.n_sym <= 0 || frame.n_sym > MAX_SYM ||
+        frame.n_encoded_bits > MAX_ENCODED_BITS) {
+        return;
+    }
+    d_ht_active = true;
+    d_ht_mcs = mcs;
+    d_ht_len = len;
+    d_ht_nsym = frame.n_sym;
+    d_ht_dsym = 0;
+    std::cout << "[HT-BEGIN] mcs=" << mcs << " len=" << len << " nsym=" << frame.n_sym
+              << std::endl;
+    d_ht_nbpsc = ofdm.n_bpsc;
+    d_ht_ncbps = ofdm.n_cbps;
+    d_ht_ndbps = ofdm.n_dbps;
+}
+
+// Equalize + demap one HT DATA OFDM symbol (raw FFT), appending n_cbps coded
+// bits. Reuses the L-LTF channel (SISO: HT data channel == L-LTF), extrapolating
+// the 4 HT edge carriers, with pilot-based common-phase correction.
+void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
+{
+    const gr_complex* h = d_equalizer->get_h();
+
+    gr_complex eqd[64];
+    for (int i = 4; i <= 60; i++) {
+        gr_complex hi = h[i];
+        if (i < 6) {
+            hi = h[6]; // edge carriers (-28,-27) not in L-LTF -> nearest inner
+        } else if (i > 58) {
+            hi = h[58]; // edge carriers (27,28)
+        }
+        gr_complex r =
+            raw[i] * exp(gr_complex(0,
+                                    2 * M_PI * sym_idx * 80 *
+                                        (d_epsilon0 + d_er_frozen) * (i - 32) / 64));
+        eqd[i] = r / hi;
+    }
+
+    // common phase from the 4 pilots {11,25,39,53} = {+1,+1,+1,-1} * Pn
+    gr_complex p = equalizer::base::POLARITY[(sym_idx - 2) % 127];
+    gr_complex acc = eqd[11] * p + eqd[25] * p + eqd[39] * p + eqd[53] * (-p);
+    gr_complex derot = std::polar(1.0f, (float)(-std::arg(acc)));
+
+    int b0 = d_ht_dsym * d_ht_ncbps;
+    int c = 0;
+    for (int i = 4; i <= 60; i++) {
+        if (!ht20_is_data(i)) {
+            continue;
+        }
+        gr_complex sym = eqd[i] * derot;
+        if (d_ht_nbpsc == 1) { // BPSK
+            d_ht_rx_bits[b0 + c] = std::real(sym) > 0 ? 1 : 0;
+            c += 1;
+        } else if (d_ht_nbpsc == 2) { // QPSK
+            d_ht_rx_bits[b0 + c] = std::real(sym) > 0 ? 1 : 0;
+            d_ht_rx_bits[b0 + c + 1] = std::imag(sym) > 0 ? 1 : 0;
+            c += 2;
+        } else {
+            c += d_ht_nbpsc; // higher QAM slicer: TODO
+        }
+    }
+    d_ht_dsym++;
+    if (d_ht_dsym >= d_ht_nsym) {
+        ht_finish();
+        d_ht_active = false;
+    }
+}
+
+void frame_equalizer_impl::ht_finish()
+{
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + d_ht_mcs), 20);
+    frame_param frame(ofdm, d_ht_len);
+    const int ncbps = d_ht_ncbps;
+
+    // HT BCC deinterleaver (802.11-2016 19.3.11.7). HT uses N_COL=13,
+    // N_ROW=4*N_BPSCS (NOT the legacy N_COL=16). The interleaver maps coded-bit
+    // index k -> transmitted subcarrier position j; deinterleave inverts it:
+    // deint[k] = rx[j(k)]. (Third permutation/freq-rotation is N_SS>1 only.)
+    static uint8_t deint[MAX_ENCODED_BITS];
+    const int s = std::max(d_ht_nbpsc / 2, 1);
+    const int n_col = 13;
+    const int n_row = 4 * d_ht_nbpsc;
+    for (int sym = 0; sym < d_ht_nsym; sym++) {
+        for (int k = 0; k < ncbps; k++) {
+            int i = n_row * (k % n_col) + (k / n_col);
+            int j = s * (i / s) + (i + ncbps - (n_col * i) / ncbps) % s;
+            deint[sym * ncbps + k] = d_ht_rx_bits[sym * ncbps + j];
+        }
+    }
+
+    uint8_t* decoded = d_decoder.decode(&ofdm, &frame, deint);
+
+    // descramble (7-bit LFSR): SERVICE(16) + PSDU + tail
+    int state = 0;
+    static uint8_t out_bytes[MAX_PSDU_SIZE + 2];
+    std::memset(out_bytes, 0, d_ht_len + 2);
+    for (int i = 0; i < 7; i++) {
+        if (decoded[i]) {
+            state |= 1 << (6 - i);
+        }
+    }
+    out_bytes[0] = state;
+    for (int i = 7; i < d_ht_len * 8 + 16; i++) {
+        int fb = (!!(state & 64)) ^ (!!(state & 8));
+        int bit = fb ^ (decoded[i] & 0x1);
+        out_bytes[i / 8] |= bit << (i % 8);
+        state = ((state << 1) & 0x7e) | fb;
+    }
+
+    // CRC-32 over the PSDU (skip the 2-byte SERVICE field)
+    boost::crc_32_type crc;
+    crc.process_bytes(out_bytes + 2, d_ht_len);
+    bool ok = (crc.checksum() == 558161692);
+    std::cout << "[HT-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
+              << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
+              << std::endl;
 }
 
 } /* namespace ieee802_11 */
