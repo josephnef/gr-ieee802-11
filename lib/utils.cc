@@ -96,6 +96,48 @@ ofdm_param::ofdm_param(Encoding e)
 }
 
 
+ofdm_param::ofdm_param(Encoding e, int bw_mhz)
+{
+    encoding = e;
+    is_ht = true;
+    bw = bw_mhz;
+    assert(e >= gr::ieee802_11::HT_MCS_0 && e <= gr::ieee802_11::HT_MCS_31);
+
+    const int mcs = gr::ieee802_11::ht_mcs_index(e); // 0..31
+    n_ss = (mcs / 8) + 1;                            // 0..7=1, 8..15=2, ...
+    const int m = mcs % 8;                           // per-stream mod/coding 0..7
+
+    // 20 MHz: 52 data + 4 pilot, FFT 64. 40 MHz: 108 data + 6 pilot, FFT 128.
+    if (bw == 40) {
+        n_data_sc = 108;
+        n_pilot_sc = 6;
+        fft_len = 128;
+    } else {
+        n_data_sc = 52;
+        n_pilot_sc = 4;
+        fft_len = 64;
+    }
+
+    // per-stream bits/subcarrier and coding rate (num/den) by MCS-mod-8
+    int rate_num, rate_den;
+    switch (m) {
+    case 0: n_bpsc = 1; rate_num = 1; rate_den = 2; break; // BPSK   1/2
+    case 1: n_bpsc = 2; rate_num = 1; rate_den = 2; break; // QPSK   1/2
+    case 2: n_bpsc = 2; rate_num = 3; rate_den = 4; break; // QPSK   3/4
+    case 3: n_bpsc = 4; rate_num = 1; rate_den = 2; break; // 16-QAM 1/2
+    case 4: n_bpsc = 4; rate_num = 3; rate_den = 4; break; // 16-QAM 3/4
+    case 5: n_bpsc = 6; rate_num = 2; rate_den = 3; break; // 64-QAM 2/3
+    case 6: n_bpsc = 6; rate_num = 3; rate_den = 4; break; // 64-QAM 3/4
+    case 7: n_bpsc = 6; rate_num = 5; rate_den = 6; break; // 64-QAM 5/6
+    default: assert(false); rate_num = 1; rate_den = 2; break;
+    }
+
+    n_cbps = n_data_sc * n_bpsc * n_ss;
+    n_dbps = n_cbps * rate_num / rate_den;
+    rate_field = 0; // HT uses HT-SIG, not the legacy SIGNAL rate field
+}
+
+
 void ofdm_param::print()
 {
     std::cout << "OFDM Parameters:" << std::endl;

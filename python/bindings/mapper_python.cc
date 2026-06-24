@@ -14,7 +14,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(0)                                                       */
 /* BINDTOOL_USE_PYGCCXML(0)                                                        */
 /* BINDTOOL_HEADER_FILE(mapper.h)                                        */
-/* BINDTOOL_HEADER_FILE_HASH(71fee88c2602a7b34f8996a1ff163569)                     */
+/* BINDTOOL_HEADER_FILE_HASH(d949f3e68fa21b01514ecdf4095b6453)                     */
 /***********************************************************************************/
 
 #include <pybind11/complex.h>
@@ -63,6 +63,22 @@ void bind_mapper(py::module& m)
         .value("QAM16_3_4", ::gr::ieee802_11::QAM16_3_4) // 5
         .value("QAM64_2_3", ::gr::ieee802_11::QAM64_2_3) // 6
         .value("QAM64_3_4", ::gr::ieee802_11::QAM64_3_4) // 7
+        .value("HT_MCS_0", ::gr::ieee802_11::HT_MCS_0)   // 8
+        .value("HT_MCS_1", ::gr::ieee802_11::HT_MCS_1)
+        .value("HT_MCS_2", ::gr::ieee802_11::HT_MCS_2)
+        .value("HT_MCS_3", ::gr::ieee802_11::HT_MCS_3)
+        .value("HT_MCS_4", ::gr::ieee802_11::HT_MCS_4)
+        .value("HT_MCS_5", ::gr::ieee802_11::HT_MCS_5)
+        .value("HT_MCS_6", ::gr::ieee802_11::HT_MCS_6)
+        .value("HT_MCS_7", ::gr::ieee802_11::HT_MCS_7)
+        .value("HT_MCS_8", ::gr::ieee802_11::HT_MCS_8)
+        .value("HT_MCS_9", ::gr::ieee802_11::HT_MCS_9)
+        .value("HT_MCS_10", ::gr::ieee802_11::HT_MCS_10)
+        .value("HT_MCS_11", ::gr::ieee802_11::HT_MCS_11)
+        .value("HT_MCS_12", ::gr::ieee802_11::HT_MCS_12)
+        .value("HT_MCS_13", ::gr::ieee802_11::HT_MCS_13)
+        .value("HT_MCS_14", ::gr::ieee802_11::HT_MCS_14)
+        .value("HT_MCS_15", ::gr::ieee802_11::HT_MCS_15)
         .export_values()
     ;
 

@@ -349,7 +349,13 @@ uint8_t* viterbi_decoder::decode(ofdm_param* ofdm, frame_param* frame, uint8_t* 
     int out_count = 0;
     int n_decoded = 0;
 
-    while (n_decoded < d_frame->n_data_bits) {
+    // Defensive bound: in_count indexes the fixed depunctured[] buffer
+    // (MAX_ENCODED_BITS) and out_count drives d_decoded[MAX_ENCODED_BITS*3/4].
+    // A corrupt or noise-induced frame descriptor (n_data_bits) must never run
+    // this loop past those buffers -> would be an OOB read/write (crash).
+    const int max_in = MAX_ENCODED_BITS;
+
+    while (n_decoded < d_frame->n_data_bits && in_count < max_in) {
 
         if ((in_count % 4) == 0) { // 0 or 3
             viterbi_butterfly2_generic(&depunctured[in_count & 0xfffffffc],
@@ -364,7 +370,8 @@ uint8_t* viterbi_decoder::decode(ofdm_param* ofdm, frame_param* frame, uint8_t* 
                 viterbi_get_output_generic(
                     d_metric0_generic, d_path0_generic, d_ntraceback, &c);
 
-                if (out_count >= d_ntraceback) {
+                if ((out_count >= d_ntraceback) &&
+                    ((out_count - d_ntraceback) * 8 + 8 <= MAX_ENCODED_BITS * 3 / 4)) {
                     for (int i = 0; i < 8; i++) {
                         d_decoded[(out_count - d_ntraceback) * 8 + i] =
                             (c >> (7 - i)) & 0x1;
@@ -385,27 +392,45 @@ void viterbi_decoder::reset()
 
     viterbi_chunks_init_generic();
 
-    switch (d_ofdm->encoding) {
-    case BPSK_1_2:
-    case QPSK_1_2:
-    case QAM16_1_2:
+    // Normalize the encoding to a coding rate. Legacy values map directly; HT
+    // MCS share the same BCC code, so collapse them to {1/2, 2/3, 3/4, 5/6} by
+    // the per-stream MCS-mod-8 (0,1,3 ->1/2; 5 ->2/3; 2,4,6 ->3/4; 7 ->5/6).
+    enum { R_1_2, R_2_3, R_3_4, R_5_6 } rate;
+    if (is_ht_encoding(d_ofdm->encoding)) {
+        switch (ht_mcs_index(d_ofdm->encoding) % 8) {
+        case 0: case 1: case 3: rate = R_1_2; break;
+        case 5:                 rate = R_2_3; break;
+        case 2: case 4: case 6: rate = R_3_4; break;
+        default:                rate = R_5_6; break; // MCS7-equivalent
+        }
+    } else {
+        switch (d_ofdm->encoding) {
+        case BPSK_1_2: case QPSK_1_2: case QAM16_1_2: rate = R_1_2; break;
+        case QAM64_2_3:                               rate = R_2_3; break;
+        default:                                      rate = R_3_4; break;
+        }
+    }
+
+    switch (rate) {
+    case R_1_2:
         d_ntraceback = 5;
         d_depuncture_pattern = PUNCTURE_1_2;
         d_k = 1;
         break;
-    case QAM64_2_3:
+    case R_2_3:
         d_ntraceback = 9;
         d_depuncture_pattern = PUNCTURE_2_3;
         d_k = 2;
         break;
-    case BPSK_3_4:
-    case QPSK_3_4:
-    case QAM16_3_4:
-    case QAM64_3_4:
+    case R_3_4:
         d_ntraceback = 10;
         d_depuncture_pattern = PUNCTURE_3_4;
         d_k = 3;
         break;
+    case R_5_6:
+        // TODO(phase1+): rate-5/6 (HT MCS7) puncturing not yet validated; the
+        // traceback depth needs verification. HT MCS 0-6 are supported today.
+        throw std::runtime_error("ieee802_11: HT MCS7 (rate 5/6) not yet supported");
     }
 }
 

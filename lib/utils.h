@@ -28,8 +28,15 @@ using gr::ieee802_11::Encoding;
 #define MAX_PAYLOAD_SIZE 1500
 #define MAX_PSDU_SIZE (MAX_PAYLOAD_SIZE + 28) // MAC, CRC
 #define MAX_SYM (((16 + 8 * MAX_PSDU_SIZE + 6) / 24) + 1)
-#define MAX_BITS_PER_SYM 288
+// Coded bits per OFDM symbol upper bound. Legacy max is 288 (64-QAM, 48 SC).
+// HT40 64-QAM 2 streams = 108 SC * 6 bpsc * 2 ss = 1296 -> size for the widest
+// modern mode we decode so the interleaver/depuncture buffers never overflow.
+#define MAX_BITS_PER_SYM 1296
 #define MAX_ENCODED_BITS ((16 + 8 * MAX_PSDU_SIZE + 6) * 2 + MAX_BITS_PER_SYM)
+
+// Widest data-subcarrier count carried out of frame_equalizer per OFDM symbol
+// (HT40 = 108 data SC * up to 2 spatial streams = 216). Legacy uses 48 of these.
+#define MAX_DATA_CARRIERS 216
 
 #define dout d_debug&& std::cout
 #define mylog(...)                      \
@@ -57,18 +64,30 @@ struct mac_header {
 class ofdm_param
 {
 public:
+    // Legacy 802.11a/g/p (20 MHz, 1 stream, 48 data SC).
     ofdm_param(Encoding e);
+    // 802.11n HT. e must be an HT_MCS_* value; bw is 20 or 40 (MHz). The number
+    // of spatial streams is derived from the MCS index (0..7=1ss, 8..15=2ss).
+    ofdm_param(Encoding e, int bw);
 
     // data rate
     Encoding encoding;
     // rate field of the SIGNAL header
     char rate_field;
-    // number of coded bits per sub carrier
+    // number of coded bits per sub carrier (per stream)
     int n_bpsc;
-    // number of coded bits per OFDM symbol
+    // number of coded bits per OFDM symbol (across all streams)
     int n_cbps;
-    // number of data bits per OFDM symbol
+    // number of data bits per OFDM symbol (across all streams)
     int n_dbps;
+
+    // --- format / geometry (legacy defaults set by the 1-arg constructor) ---
+    bool is_ht = false;     // true for HT_MCS_*
+    int n_ss = 1;           // spatial streams
+    int bw = 20;            // channel bandwidth in MHz (20 or 40)
+    int n_data_sc = 48;     // data subcarriers (legacy 48, HT20 52, HT40 108)
+    int n_pilot_sc = 4;     // pilot subcarriers (legacy/HT20 4, HT40 6)
+    int fft_len = 64;       // OFDM FFT size (20 MHz 64, 40 MHz 128)
 
     void print();
 };

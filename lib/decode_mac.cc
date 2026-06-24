@@ -83,19 +83,35 @@ public:
                 int encoding = pmt::to_uint64(
                     pmt::dict_ref(d_meta, pmt::mp("encoding"), pmt::from_uint64(0)));
 
-                ofdm_param ofdm = ofdm_param((Encoding)encoding);
-                frame_param frame = frame_param(ofdm, len_data);
-
-                // check for maximum frame size
-                if (frame.n_sym <= MAX_SYM && frame.psdu_size <= MAX_PSDU_SIZE) {
-                    d_ofdm = ofdm;
-                    d_frame = frame;
-                    copied = 0;
-                    dout << "Decode MAC: frame start -- len " << len_data << "  symbols "
-                         << frame.n_sym << "  encoding " << encoding << std::endl;
-                } else {
-                    dout << "Dropping frame which is too large (symbols or bits)"
+                // Only legacy encodings (0..7) are decodable on this path; an
+                // out-of-range value would leave ofdm_param uninitialized (the
+                // assert is compiled out in release) and yield a garbage frame.
+                if (encoding > QAM64_3_4) {
+                    dout << "Dropping frame with non-legacy encoding " << encoding
                          << std::endl;
+                } else {
+                    ofdm_param ofdm = ofdm_param((Encoding)encoding);
+                    frame_param frame = frame_param(ofdm, len_data);
+
+                    // Accept only fully self-consistent frames that fit every fixed
+                    // decode buffer. This guards the Viterbi/deinterleave buffers
+                    // against noise-triggered false detections.
+                    if (frame.n_sym > 0 && frame.n_sym <= MAX_SYM &&
+                        frame.psdu_size > 0 && frame.psdu_size <= MAX_PSDU_SIZE &&
+                        frame.n_data_bits > 0 && frame.n_data_bits <= MAX_ENCODED_BITS &&
+                        frame.n_encoded_bits > 0 &&
+                        frame.n_encoded_bits <= MAX_ENCODED_BITS) {
+                        d_ofdm = ofdm;
+                        d_frame = frame;
+                        copied = 0;
+                        dout << "Decode MAC: frame start -- len " << len_data
+                             << "  symbols " << frame.n_sym << "  encoding " << encoding
+                             << std::endl;
+                    } else {
+                        dout << "Dropping frame which is too large/inconsistent "
+                                "(symbols or bits)"
+                             << std::endl;
+                    }
                 }
             }
 

@@ -165,7 +165,13 @@ int frame_equalizer_impl::general_work(int noutput_items,
                                                     (d_epsilon0 + d_er) * (i - 32) / 64));
         }
 
-        gr_complex p = equalizer::base::POLARITY[(d_current_symbol - 2) % 127];
+        // POLARITY is the pilot-polarity sequence for SIGNAL/DATA symbols (index
+        // d_current_symbol-2). For the two L-LTF symbols (0,1) the index would be
+        // negative and C++'s % preserves the sign -> an out-of-bounds read (caught
+        // by AddressSanitizer; can fault depending on global layout). The value is
+        // unused for symbols <2, so clamp the index to 0 there.
+        gr_complex p =
+            equalizer::base::POLARITY[d_current_symbol < 2 ? 0 : (d_current_symbol - 2) % 127];
 
         double beta;
         if (d_current_symbol < 2) {
