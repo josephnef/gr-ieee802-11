@@ -601,6 +601,17 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
     gr_complex acc = eqd[11] * p + eqd[25] * p + eqd[39] * p + eqd[53] * (-p);
     gr_complex derot = std::polar(1.0f, (float)(-std::arg(acc)));
 
+    // Demap each data carrier to n_bpsc bits via the matching constellation's
+    // decision_maker (same Gray mapping the legacy path / standard use), then
+    // expand LSB-first -- exactly how decode_mac unpacks symbols.
+    std::shared_ptr<gr::digital::constellation> mod = d_64qam;
+    if (d_ht_nbpsc == 1) {
+        mod = d_bpsk;
+    } else if (d_ht_nbpsc == 2) {
+        mod = d_qpsk;
+    } else if (d_ht_nbpsc == 4) {
+        mod = d_16qam;
+    }
     int b0 = d_ht_dsym * d_ht_ncbps;
     int c = 0;
     for (int i = 4; i <= 60; i++) {
@@ -608,16 +619,11 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
             continue;
         }
         gr_complex sym = eqd[i] * derot;
-        if (d_ht_nbpsc == 1) { // BPSK
-            d_ht_rx_bits[b0 + c] = std::real(sym) > 0 ? 1 : 0;
-            c += 1;
-        } else if (d_ht_nbpsc == 2) { // QPSK
-            d_ht_rx_bits[b0 + c] = std::real(sym) > 0 ? 1 : 0;
-            d_ht_rx_bits[b0 + c + 1] = std::imag(sym) > 0 ? 1 : 0;
-            c += 2;
-        } else {
-            c += d_ht_nbpsc; // higher QAM slicer: TODO
+        unsigned int val = mod->decision_maker(&sym);
+        for (int k = 0; k < d_ht_nbpsc; k++) {
+            d_ht_rx_bits[b0 + c + k] = (val >> k) & 1;
         }
+        c += d_ht_nbpsc;
     }
     d_ht_dsym++;
     if (d_ht_dsym >= d_ht_nsym) {

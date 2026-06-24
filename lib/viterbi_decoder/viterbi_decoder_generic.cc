@@ -428,9 +428,10 @@ void viterbi_decoder::reset()
         d_k = 3;
         break;
     case R_5_6:
-        // TODO(phase1+): rate-5/6 (HT MCS7) puncturing not yet validated; the
-        // traceback depth needs verification. HT MCS 0-6 are supported today.
-        throw std::runtime_error("ieee802_11: HT MCS7 (rate 5/6) not yet supported");
+        d_ntraceback = 13;
+        d_depuncture_pattern = PUNCTURE_5_6;
+        d_k = 5;
+        break;
     }
 }
 

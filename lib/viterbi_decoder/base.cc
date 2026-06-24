@@ -77,3 +77,6 @@ const unsigned char base::PARTAB[256] = {
 const unsigned char base::PUNCTURE_1_2[2] = { 1, 1 };
 const unsigned char base::PUNCTURE_2_3[4] = { 1, 1, 1, 0 };
 const unsigned char base::PUNCTURE_3_4[6] = { 1, 1, 1, 0, 0, 1 };
+// 5/6: keep 6 of every 10 mother-code bits (drop indices 3,4,7,8) -> the TX
+// puncturing in tools_gen_wifi.py matches this.
+const unsigned char base::PUNCTURE_5_6[10] = { 1, 1, 1, 0, 0, 1, 1, 0, 0, 1 };

@@ -58,6 +58,7 @@ protected:
     static const unsigned char PUNCTURE_1_2[2];
     static const unsigned char PUNCTURE_2_3[4];
     static const unsigned char PUNCTURE_3_4[6];
+    static const unsigned char PUNCTURE_5_6[10];
 
     virtual void reset() = 0;
     uint8_t* depuncture(uint8_t* in);
