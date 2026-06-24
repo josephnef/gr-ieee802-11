@@ -35,5 +35,6 @@ jobs:
         run: |
           OOT=$(find /opt/grwifi -name ieee802_11 -type d -path '*packages*' | head -1)
           export PYTHONPATH="${OOT%/ieee802_11}"
-          export LD_LIBRARY_PATH=/opt/grwifi/lib:/opt/grwifi/lib64
+          # include the Debian/Ubuntu multiarch libdir where the .so installs
+          export LD_LIBRARY_PATH="$(echo /opt/grwifi/lib/*-linux-gnu):/opt/grwifi/lib:/opt/grwifi/lib64"
           python3 -c "import ieee802_11; print('ieee802_11 OK')"
