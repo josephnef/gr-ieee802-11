@@ -30,7 +30,8 @@ class frame_equalizer_impl : virtual public frame_equalizer
 {
 
 public:
-    frame_equalizer_impl(Equalizer algo, double freq, double bw, bool log, bool debug);
+    frame_equalizer_impl(
+        Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len);
     ~frame_equalizer_impl();
 
     void set_algorithm(Equalizer algo);
@@ -59,7 +60,8 @@ private:
     bool try_ht_sig(const gr_complex* eq, int& mcs, int& cbw, int& len, int& stbc,
                     int& fec, int& sgi);
 
-    gr_complex d_ht_raw[2][64]; // raw FFT bins of the 2 candidate HT-SIG symbols
+    int d_fft_len;              // 64 (20 MHz) or 128 (HT40)
+    gr_complex d_ht_raw[2][128]; // raw FFT bins of the 2 candidate HT-SIG symbols
     double d_er_frozen;         // residual-CFO estimate frozen at L-SIG (pre HT-SIG)
 
     // HT DATA decode (Phase 1b-ii). After HT-SIG validates we re-equalize the

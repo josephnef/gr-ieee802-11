@@ -39,7 +39,10 @@ class IEEE802_11_API frame_equalizer : virtual public gr::block
 
 public:
     typedef std::shared_ptr<frame_equalizer> sptr;
-    static sptr make(Equalizer algo, double freq, double bw, bool log, bool debug);
+    // fft_len: 64 (20 MHz, default) or 128 (HT40). 128 enables the HT 40 MHz
+    // receive path; the legacy/HT20 paths are unchanged at 64.
+    static sptr
+    make(Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len = 64);
     virtual void set_algorithm(Equalizer algo) = 0;
     virtual void set_bandwidth(double bw) = 0;
     virtual void set_frequency(double freq) = 0;

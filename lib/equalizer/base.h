@@ -40,14 +40,18 @@ public:
 
     std::vector<gr_complex> get_csi();
 
-    // L-LTF channel estimate (64 FFT bins). Valid after the 2 LTF symbols; used
-    // by the HT path to equalize HT-SIG/HT data without the legacy pilot tracking.
+    // L-LTF channel estimate (FFT bins). Valid after the 2 LTF symbols; used by
+    // the HT path to equalize HT-SIG/HT data without the legacy pilot tracking.
     const gr_complex* get_h() const { return d_H; }
+    // FFT size: 64 (20 MHz) or 128 (HT40). Selects which L-LTF the estimator uses.
+    void set_fft_len(int n) { d_fft_len = n; }
 
 protected:
     static const gr_complex LONG[64];
+    static const gr_complex LONG40[128]; // HT40 non-HT-duplicate L-LTF (128 bins)
 
-    gr_complex d_H[64];
+    int d_fft_len = 64;
+    gr_complex d_H[128];
 };
 
 } // namespace equalizer

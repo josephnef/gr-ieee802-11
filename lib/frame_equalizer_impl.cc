@@ -29,18 +29,18 @@
 namespace gr {
 namespace ieee802_11 {
 
-frame_equalizer::sptr
-frame_equalizer::make(Equalizer algo, double freq, double bw, bool log, bool debug)
+frame_equalizer::sptr frame_equalizer::make(
+    Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len)
 {
     return gnuradio::get_initial_sptr(
-        new frame_equalizer_impl(algo, freq, bw, log, debug));
+        new frame_equalizer_impl(algo, freq, bw, log, debug, fft_len));
 }
 
 
 frame_equalizer_impl::frame_equalizer_impl(
-    Equalizer algo, double freq, double bw, bool log, bool debug)
+    Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len)
     : gr::block("frame_equalizer",
-                gr::io_signature::make(1, 1, 64 * sizeof(gr_complex)),
+                gr::io_signature::make(1, 1, fft_len * sizeof(gr_complex)),
                 gr::io_signature::make(1, 1, 48)),
       d_current_symbol(0),
       d_log(log),
@@ -48,6 +48,7 @@ frame_equalizer_impl::frame_equalizer_impl(
       d_equalizer(NULL),
       d_freq(freq),
       d_bw(bw),
+      d_fft_len(fft_len),
       d_frame_bytes(0),
       d_frame_symbols(0),
       d_freq_offset_from_synclong(0.0)
@@ -95,6 +96,7 @@ void frame_equalizer_impl::set_algorithm(Equalizer algo)
     default:
         throw std::runtime_error("Algorithm not implemented");
     }
+    d_equalizer->set_fft_len(d_fft_len);
 }
 
 void frame_equalizer_impl::set_bandwidth(double bw)
@@ -129,7 +131,10 @@ int frame_equalizer_impl::general_work(int noutput_items,
     int i = 0;
     int o = 0;
     gr_complex symbols[48];
-    gr_complex current_symbol[64];
+    gr_complex current_symbol[128];
+    const int fft = d_fft_len;        // 64 or 128
+    const int dc = fft / 2;           // DC bin
+    const int slen = fft + fft / 4;   // OFDM symbol length in samples (80 or 160)
 
     dout << "FRAME EQUALIZER: input " << ninput_items[0] << "  output " << noutput_items
          << std::endl;
@@ -163,7 +168,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
             continue;
         }
 
-        std::memcpy(current_symbol, in + i * 64, 64 * sizeof(gr_complex));
+        std::memcpy(current_symbol, in + i * fft, fft * sizeof(gr_complex));
 
         // HT (Phase 1b): stash the *raw* FFT of the two symbols after L-SIG
         // (candidate HT-SIG) before any legacy ramp/pilot correction mutates
@@ -172,16 +177,16 @@ int frame_equalizer_impl::general_work(int noutput_items,
         // HT path re-equalizes these raw symbols itself (see sniff_ht_sig).
         if (d_current_symbol == 3) {
             d_er_frozen = d_er;
-            std::memcpy(d_ht_raw[0], in + i * 64, 64 * sizeof(gr_complex));
+            std::memcpy(d_ht_raw[0], in + i * fft, fft * sizeof(gr_complex));
         } else if (d_current_symbol == 4) {
-            std::memcpy(d_ht_raw[1], in + i * 64, 64 * sizeof(gr_complex));
+            std::memcpy(d_ht_raw[1], in + i * fft, fft * sizeof(gr_complex));
         }
 
         // compensate sampling offset
-        for (int i = 0; i < 64; i++) {
-            current_symbol[i] *= exp(gr_complex(0,
-                                                2 * M_PI * d_current_symbol * 80 *
-                                                    (d_epsilon0 + d_er) * (i - 32) / 64));
+        for (int k = 0; k < fft; k++) {
+            current_symbol[k] *= exp(gr_complex(0,
+                                                2 * M_PI * d_current_symbol * slen *
+                                                    (d_epsilon0 + d_er) * (k - dc) / fft));
         }
 
         // POLARITY is the pilot-polarity sequence for SIGNAL/DATA symbols (index
@@ -207,7 +212,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
                         (conj(d_prev_pilots[2]) * current_symbol[39] * p) +
                         (conj(d_prev_pilots[3]) * current_symbol[53] * -p));
 
-        er *= d_bw / (2 * M_PI * d_freq * 80);
+        er *= d_bw / (2 * M_PI * d_freq * slen);
 
         if (d_current_symbol < 2) {
             d_prev_pilots[0] = current_symbol[11];
@@ -222,8 +227,8 @@ int frame_equalizer_impl::general_work(int noutput_items,
         }
 
         // compensate residual frequency offset
-        for (int i = 0; i < 64; i++) {
-            current_symbol[i] *= exp(gr_complex(0, -beta));
+        for (int k = 0; k < fft; k++) {
+            current_symbol[k] *= exp(gr_complex(0, -beta));
         }
 
         // update estimate of residual frequency offset
@@ -245,7 +250,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
         }
         // HT DATA symbols start after L-SIG(2), HT-SIG(3,4), HT-STF(5), HT-LTF(6).
         if (d_ht_active && d_current_symbol >= 7) {
-            ht_data_symbol(in + i * 64, d_current_symbol);
+            ht_data_symbol(in + i * fft, d_current_symbol);
         }
 
         // signal field
@@ -434,13 +439,17 @@ void frame_equalizer_impl::equalize_ht_sig(const gr_complex* raw,
                                            const gr_complex* h,
                                            gr_complex* out48)
 {
-    // ramp + channel-equalize the 52 occupied bins (48 data + 4 pilots)
-    gr_complex eqd[64];
+    // HT-SIG sits on the LOWER 20 MHz subchannel (bins 6..58, pilots 11/25/39/53)
+    // in both HT20 and HT40, so the bin layout is identical; only the sampling
+    // ramp depends on the FFT size.
+    const int dc = d_fft_len / 2;
+    const int slen = d_fft_len + d_fft_len / 4;
+    gr_complex eqd[128];
     for (int i = 6; i <= 58; i++) {
-        gr_complex r =
-            raw[i] * exp(gr_complex(0,
-                                    2 * M_PI * sym_idx * 80 *
-                                        (d_epsilon0 + d_er_frozen) * (i - 32) / 64));
+        gr_complex r = raw[i] * exp(gr_complex(0,
+                                               2 * M_PI * sym_idx * slen *
+                                                   (d_epsilon0 + d_er_frozen) *
+                                                   (i - dc) / d_fft_len));
         eqd[i] = r / h[i];
     }
     // Common-phase derotation from the 4 HT-SIG pilots {11,25,39,53}, which are

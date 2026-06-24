@@ -29,19 +29,23 @@ void ls::equalize(gr_complex* in,
 {
 
     if (n == 0) {
-        std::memcpy(d_H, in, 64 * sizeof(gr_complex));
+        std::memcpy(d_H, in, d_fft_len * sizeof(gr_complex));
 
     } else if (n == 1) {
+        // Estimate over all occupied bins. For HT40 (fft_len 128) use the
+        // non-HT-duplicate L-LTF (LONG40); occupied bins are exactly where the
+        // L-LTF table is non-zero (guards/DC/subchannel-gap are zero -> skipped).
+        const gr_complex* lng = (d_fft_len == 128) ? LONG40 : LONG;
         double signal = 0;
         double noise = 0;
-        for (int i = 0; i < 64; i++) {
-            if ((i == 32) || (i < 6) || (i > 58)) {
+        for (int i = 0; i < d_fft_len; i++) {
+            if (lng[i] == gr_complex(0, 0)) {
                 continue;
             }
             noise += std::pow(std::abs(d_H[i] - in[i]), 2);
             signal += std::pow(std::abs(d_H[i] + in[i]), 2);
             d_H[i] += in[i];
-            d_H[i] /= LONG[i] * gr_complex(2, 0);
+            d_H[i] /= lng[i] * gr_complex(2, 0);
         }
 
         d_snr = 10 * std::log10(signal / noise / 2);
