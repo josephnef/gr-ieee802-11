@@ -71,6 +71,8 @@ private:
     void ht_begin(int mcs, int len);
     void ht_data_symbol(const gr_complex* raw, int sym_idx);
     void ht_finish();
+    void ht_estimate_ltf40(const gr_complex* raw); // HT40 channel est from HT-LTF
+    gr_complex d_ht_h[128];   // HT40 data channel estimate (from the HT-LTF)
     bool d_ht_active = false;
     int d_ht_mcs = 0;
     int d_ht_len = 0;

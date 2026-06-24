@@ -37,6 +37,7 @@ public:
     virtual double get_snr() = 0;
 
     static const gr_complex POLARITY[127];
+    static const gr_complex HTLTF40[128]; // HT40 HT-LTF (all 114 occupied bins)
 
     std::vector<gr_complex> get_csi();
 
@@ -48,7 +49,7 @@ public:
 
 protected:
     static const gr_complex LONG[64];
-    static const gr_complex LONG40[128]; // HT40 non-HT-duplicate L-LTF (128 bins)
+    static const gr_complex LONG40[128];   // HT40 non-HT-duplicate L-LTF (128 bins)
 
     int d_fft_len = 64;
     gr_complex d_H[128];

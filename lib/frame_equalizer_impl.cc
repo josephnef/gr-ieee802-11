@@ -248,6 +248,11 @@ int frame_equalizer_impl::general_work(int noutput_items,
         if (d_current_symbol == 4) {
             sniff_ht_sig();
         }
+        // HT40 needs a real channel estimate from the HT-LTF (sym6): the duplicate
+        // L-LTF has a center gap the HT40 data fills. (HT20 reuses the L-LTF.)
+        if (d_ht_active && fft == 128 && d_current_symbol == 6) {
+            ht_estimate_ltf40(in + i * fft);
+        }
         // HT DATA symbols start after L-SIG(2), HT-SIG(3,4), HT-STF(5), HT-LTF(6).
         if (d_ht_active && d_current_symbol >= 7) {
             ht_data_symbol(in + i * fft, d_current_symbol);
@@ -541,11 +546,18 @@ void frame_equalizer_impl::sniff_ht_sig()
     }
 }
 
-// HT20 data subcarriers: FFT bins 4..60 excluding DC(32) and pilots
-// {11,25,39,53} -> 52 carriers in ascending-frequency (logical SC) order.
+// HT20 data subcarriers: FFT bins 4..60 excluding DC(32) and pilots {11,25,39,53}.
 static bool ht20_is_data(int i)
 {
     return i >= 4 && i <= 60 && i != 32 && i != 11 && i != 25 && i != 39 && i != 53;
+}
+// HT40 (128-FFT) data subcarriers: bins 6..62 and 66..122 minus the 6 pilots.
+static bool ht40_is_data(int i)
+{
+    if (!((i >= 6 && i <= 62) || (i >= 66 && i <= 122))) {
+        return false;
+    }
+    return i != 11 && i != 39 && i != 53 && i != 75 && i != 89 && i != 117;
 }
 
 void frame_equalizer_impl::ht_begin(int mcs, int len)
@@ -553,7 +565,8 @@ void frame_equalizer_impl::ht_begin(int mcs, int len)
     if (mcs > 7) { // SISO only for now (MCS 0..7 = 1 stream)
         return;
     }
-    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + mcs), 20);
+    const int bw = (d_fft_len == 128) ? 40 : 20;
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + mcs), bw);
     frame_param frame(ofdm, len);
     if (frame.n_sym <= 0 || frame.n_sym > MAX_SYM ||
         frame.n_encoded_bits > MAX_ENCODED_BITS) {
@@ -564,43 +577,68 @@ void frame_equalizer_impl::ht_begin(int mcs, int len)
     d_ht_len = len;
     d_ht_nsym = frame.n_sym;
     d_ht_dsym = 0;
-    std::cout << "[HT-BEGIN] mcs=" << mcs << " len=" << len << " nsym=" << frame.n_sym
-              << std::endl;
     d_ht_nbpsc = ofdm.n_bpsc;
     d_ht_ncbps = ofdm.n_cbps;
     d_ht_ndbps = ofdm.n_dbps;
 }
 
+// HT40 channel estimate from the HT-LTF (sym6): d_H[i] = raw[i]*ramp/HTLTF40[i]
+// over the 114 occupied bins. Needed because the duplicate L-LTF leaves the
+// center carriers null.
+void frame_equalizer_impl::ht_estimate_ltf40(const gr_complex* raw)
+{
+    const int dc = 64, slen = 160;
+    for (int i = 0; i < 128; i++) {
+        gr_complex ref = equalizer::base::HTLTF40[i];
+        if (ref == gr_complex(0, 0)) {
+            continue;
+        }
+        gr_complex r = raw[i] * exp(gr_complex(0,
+                                               2 * M_PI * 6 * slen *
+                                                   (d_epsilon0 + d_er_frozen) *
+                                                   (i - dc) / 128));
+        d_ht_h[i] = r / ref;
+    }
+}
+
 // Equalize + demap one HT DATA OFDM symbol (raw FFT), appending n_cbps coded
-// bits. Reuses the L-LTF channel (SISO: HT data channel == L-LTF), extrapolating
-// the 4 HT edge carriers, with pilot-based common-phase correction.
+// bits, with pilot-based common-phase correction. HT20 reuses the L-LTF channel
+// (edge carriers extrapolated); HT40 uses the HT-LTF estimate (d_ht_h).
 void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
 {
-    const gr_complex* h = d_equalizer->get_h();
+    const bool ht40 = (d_fft_len == 128);
+    const int dc = d_fft_len / 2;
+    const int slen = d_fft_len + d_fft_len / 4;
+    const gr_complex* h = ht40 ? d_ht_h : d_equalizer->get_h();
 
-    gr_complex eqd[64];
-    for (int i = 4; i <= 60; i++) {
+    gr_complex eqd[128];
+    const int lo = ht40 ? 6 : 4;
+    const int hi_bin = ht40 ? 122 : 60;
+    for (int i = lo; i <= hi_bin; i++) {
         gr_complex hi = h[i];
-        if (i < 6) {
-            hi = h[6]; // edge carriers (-28,-27) not in L-LTF -> nearest inner
-        } else if (i > 58) {
-            hi = h[58]; // edge carriers (27,28)
+        if (!ht40 && i < 6) {
+            hi = h[6]; // HT20 edge carriers (-28,-27) not in L-LTF
+        } else if (!ht40 && i > 58) {
+            hi = h[58]; // HT20 edge carriers (27,28)
         }
-        gr_complex r =
-            raw[i] * exp(gr_complex(0,
-                                    2 * M_PI * sym_idx * 80 *
-                                        (d_epsilon0 + d_er_frozen) * (i - 32) / 64));
+        gr_complex r = raw[i] * exp(gr_complex(0,
+                                               2 * M_PI * sym_idx * slen *
+                                                   (d_epsilon0 + d_er_frozen) *
+                                                   (i - dc) / d_fft_len));
         eqd[i] = r / hi;
     }
 
-    // common phase from the 4 pilots {11,25,39,53} = {+1,+1,+1,-1} * Pn
+    // common phase from the pilots (HT20: 4 at {11,25,39,53} sign {+,+,+,-};
+    // HT40: 6 at {11,39,53,75,89,117} sign {+,+,+,-,-,+}) times the polarity Pn.
     gr_complex p = equalizer::base::POLARITY[(sym_idx - 2) % 127];
-    gr_complex acc = eqd[11] * p + eqd[25] * p + eqd[39] * p + eqd[53] * (-p);
+    gr_complex acc;
+    if (ht40) {
+        acc = (eqd[11] + eqd[39] + eqd[53] - eqd[75] - eqd[89] + eqd[117]) * p;
+    } else {
+        acc = (eqd[11] + eqd[25] + eqd[39] - eqd[53]) * p;
+    }
     gr_complex derot = std::polar(1.0f, (float)(-std::arg(acc)));
 
-    // Demap each data carrier to n_bpsc bits via the matching constellation's
-    // decision_maker (same Gray mapping the legacy path / standard use), then
-    // expand LSB-first -- exactly how decode_mac unpacks symbols.
     std::shared_ptr<gr::digital::constellation> mod = d_64qam;
     if (d_ht_nbpsc == 1) {
         mod = d_bpsk;
@@ -611,8 +649,8 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
     }
     int b0 = d_ht_dsym * d_ht_ncbps;
     int c = 0;
-    for (int i = 4; i <= 60; i++) {
-        if (!ht20_is_data(i)) {
+    for (int i = lo; i <= hi_bin; i++) {
+        if (!(ht40 ? ht40_is_data(i) : ht20_is_data(i))) {
             continue;
         }
         gr_complex sym = eqd[i] * derot;
@@ -631,18 +669,18 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
 
 void frame_equalizer_impl::ht_finish()
 {
-    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + d_ht_mcs), 20);
+    const int bw = (d_fft_len == 128) ? 40 : 20;
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + d_ht_mcs), bw);
     frame_param frame(ofdm, d_ht_len);
     const int ncbps = d_ht_ncbps;
 
-    // HT BCC deinterleaver (802.11-2016 19.3.11.7). HT uses N_COL=13,
-    // N_ROW=4*N_BPSCS (NOT the legacy N_COL=16). The interleaver maps coded-bit
-    // index k -> transmitted subcarrier position j; deinterleave inverts it:
-    // deint[k] = rx[j(k)]. (Third permutation/freq-rotation is N_SS>1 only.)
+    // HT BCC deinterleaver (802.11-2016 19.3.11.7). 20 MHz: N_COL=13,
+    // N_ROW=4*N_BPSCS; 40 MHz: N_COL=18, N_ROW=6*N_BPSCS. The interleaver maps
+    // coded-bit index k -> tx subcarrier position j; deinterleave inverts it.
     static uint8_t deint[MAX_ENCODED_BITS];
     const int s = std::max(d_ht_nbpsc / 2, 1);
-    const int n_col = 13;
-    const int n_row = 4 * d_ht_nbpsc;
+    const int n_col = (bw == 40) ? 18 : 13;
+    const int n_row = (bw == 40 ? 6 : 4) * d_ht_nbpsc;
     for (int sym = 0; sym < d_ht_nsym; sym++) {
         for (int k = 0; k < ncbps; k++) {
             int i = n_row * (k % n_col) + (k / n_col);
