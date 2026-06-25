@@ -5,6 +5,59 @@ with Ettus N210s and B210s. Interoperability was tested with many off-the-shelf
 WiFi cards and IEEE 802.11p prototypes. The code can also be used in
 simulations.
 
+---
+
+# This fork: modern-OFDM RX decode (HT / VHT / STBC / LDPC / MIMO)
+
+This is a fork of **[bastibl/gr-ieee802-11](https://github.com/bastibl/gr-ieee802-11)**
+that extends the **receive** path from legacy 802.11a/g/p to modern OFDM, while
+keeping bastibl's proven C++ block architecture (`sync_short` → `sync_long` →
+`frame_equalizer` → `decode_mac`) and the surrounding ecosystem (gr-foo, the
+Wireshark connector, the `.grc` flow graphs). It is **RX-focused**: it blind-decodes
+a captured frame to recover its format / MCS / coding / FCS, which is what you need
+to verify what a transmitter actually put on the air. **TX is unchanged** (still
+legacy a/g/p).
+
+**What this fork adds (all RX, validated to CRC/FCS):**
+
+- **802.11n HT**: HT20 and HT40 SISO (MCS 0–7), HT20 2×2 **MIMO** (MCS 8–15, MMSE).
+- **802.11ac VHT**: SU SISO, 20 MHz, NSS=1, MCS 0–7 (VHT-SIG-A + VHT-SIG-B + VHT data).
+- **STBC** (Alamouti, 1 SS → 2 STS) and **LDPC** (the `fec=1` path, R=1/2 n=648).
+- **Real-RF fixes** so the above decode over the air, not just in simulation:
+  `sync_short` no longer re-triggers on the HT/VHT mid-frame short-training field
+  (HT-STF), and the HT-SIG re-equalization drops a sampling-offset ramp that is
+  invalid when an SDR captures an independent (non-co-referenced) transmitter.
+
+Validated end-to-end against real Realtek silicon (RTL8812AU via the
+[devourer](https://github.com/OpenIPC/devourer) userspace driver) captured on a
+B210: HT and VHT SIG fields blind-decode to the transmitted MCS. The synthetic
+test harness and the over-the-air bring-up tooling live in a companion repo,
+**[sdr2wifi](https://github.com/josephnef/sdr2wifi)**.
+
+**Not (yet) decoded:** 256-QAM (VHT MCS 8–9), 40/80/160 MHz VHT, NSS > 1 VHT,
+HT MCS > 15. TX of any modern format.
+
+## How this relates to the two reference projects
+
+| | **bastibl/gr-ieee802-11** (upstream) | **this fork** | **cloud9477/gr-ieee80211** (“GR-WiFi”) |
+|---|---|---|---|
+| Lineage | original | fork of bastibl | independent, from scratch (not a bastibl fork) |
+| Language | C++ GNU Radio OOT | same | Python PHY (`phy80211`) + GNU Radio |
+| Formats | 802.11a/g/p (legacy) | + 802.11n HT, 802.11ac VHT (SU), STBC, LDPC — **RX** | 802.11a/n/ac, spec-compliant **TX + RX** |
+| Focus | a working legacy transceiver | blind RX decode for driver/PHY **completeness testing** | a complete, spec-faithful soft-PHY |
+| Weight | light | light (minimal extension of upstream) | heavier / more complete |
+
+If you want a complete, spec-compliant 802.11 soft-radio (TX and RX), use
+**GR-WiFi**. If you want a light extension of the classic bastibl C++ receiver that
+blind-decodes HT/VHT frames off the air to check what hardware transmitted, this
+fork is for you. GR-WiFi also makes an excellent *independent* reference TX for
+cross-checking this fork's RX (its PHY shares no code with this one).
+
+See [`CLAUDE.md`](CLAUDE.md) for the internal architecture and where each format is
+decoded.
+
+---
+
 # Table of Contents
 1. [Development](#development)
 
