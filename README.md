@@ -7,18 +7,18 @@ simulations.
 
 ---
 
-# This fork: modern-OFDM RX decode (HT / VHT / STBC / LDPC / MIMO)
+# This fork: modern-OFDM RX decode + TX (HT / VHT / LDPC / STBC)
 
 This is a fork of **[bastibl/gr-ieee802-11](https://github.com/bastibl/gr-ieee802-11)**
-that extends the **receive** path from legacy 802.11a/g/p to modern OFDM, while
-keeping bastibl's proven C++ block architecture (`sync_short` → `sync_long` →
-`frame_equalizer` → `decode_mac`) and the surrounding ecosystem (gr-foo, the
-Wireshark connector, the `.grc` flow graphs). It is **RX-focused**: it blind-decodes
-a captured frame to recover its format / MCS / coding / FCS, which is what you need
-to verify what a transmitter actually put on the air. **TX is unchanged** (still
-legacy a/g/p).
+that extends both the **receive** and the **transmit** path from legacy 802.11a/g/p
+to modern OFDM, while keeping bastibl's proven C++ block architecture (`sync_short` →
+`sync_long` → `frame_equalizer` → `decode_mac` on RX) and the surrounding ecosystem
+(gr-foo, the Wireshark connector, the `.grc` flow graphs). The RX side blind-decodes a
+captured frame to recover its format / MCS / coding / FCS; the TX side builds
+spec/chip-compatible HT/VHT/LDPC frames that a real Realtek RTL8812AU receives over the
+air. The legacy a/g/p TX chain is untouched.
 
-**What this fork adds (all RX, validated to CRC/FCS):**
+**What this fork adds on RX (validated to CRC/FCS):**
 
 - **802.11n HT**: HT20 and HT40 SISO (MCS 0–7), HT20 2×2 **MIMO** (MCS 8–15, MMSE).
 - **802.11ac VHT**: SU SISO, 20 MHz, NSS=1, MCS 0–7 (VHT-SIG-A + VHT-SIG-B + VHT data).
@@ -35,7 +35,60 @@ test harness and the over-the-air bring-up tooling live in a companion repo,
 **[sdr2wifi](https://github.com/josephnef/sdr2wifi)**.
 
 **Not (yet) decoded:** 256-QAM (VHT MCS 8–9), 40/80/160 MHz VHT, NSS > 1 VHT,
-HT MCS > 15. TX of any modern format.
+HT MCS > 15.
+
+## Modern-format TX (the `frame_builder` block)
+
+The TX side is one new C++ block, **`ieee802_11::frame_builder`** (mirroring the RX's
+single-block design). It takes a PSDU as a PDU message on port `in` and emits the
+finished time-domain frame as a tagged-stream burst of `gr_complex` (a `packet_len`
+tag), ready for a USRP or file sink. The DSP core (`lib/tx/wifi_tx.cc`) is decoupled
+from GNU Radio and reused by a standalone generator (`lib/tx/tx_gen.cc`).
+
+Getting a frame that *real silicon* accepts (not just a lenient software RX) needed a
+specific recipe — the same two bugs sink every "decoder-targeted" generator:
+SIG-field **reserved bits must be 1** (HT-SIG B24–26; VHT-SIG-A), and the DATA
+**pilots must cycle** (base pattern rotated by the data-symbol index × the polarity
+sequence at the right start index). Plus per-format details: spec HT-STF/VHT-STF (the
+L-STF, not a placeholder), VHT-SIG-B CRC seeding the DATA SERVICE field, the spec L-SIG
+length, and — found empirically against the chip — **no LDPC tone mapping at 20 MHz**
+(D_TM = 1, in-order).
+
+**Chip-validated over the air** (B210 TX → RTL8812AU via [devourer](https://github.com/OpenIPC/devourer),
+decoded with FCS = 0 at the expected DESC_RATE/bw/ldpc):
+
+- **HT20** SISO BCC, MCS 0–7
+- **HT40** SISO BCC, MCS 0–7 (needs a 40 MHz monitor channel on the RX side)
+- **VHT20** SU SISO BCC, MCS 0–7
+- **HT20 LDPC**, MCS 0 (R=1/2 n=648; header-only GF(2) systematic encoder in
+  `lib/ldpc_encoder.h`, round-trip tested against the in-tree min-sum decoder)
+- **HT20 STBC**, MCS 0–7 (1 SS → 2 STS Alamouti, transmitted from two synchronized
+  B210 channels). The chip's STBC convention was reverse-engineered by transmitting
+  STBC *with the chip itself* and separating its two TX streams from a 2-channel B210
+  capture — that's how the HT-LTF P-matrix bug (`[[1,1],[-1,1]]` vs the standard
+  `[[1,-1],[1,1]]`) was found.
+- **HT20 2×2 MIMO**, MCS 8–15 (two spatial streams, stream parser + per-stream
+  interleaver + per-stream pilots, standard HT-LTF P-matrix). Antenna 0 is
+  sample-identical to GR-WiFi's stream 0; over the air the RTL8812AU's two RX antennas
+  separate the streams and decode at the expected MCS with FCS = 0.
+
+So the full modern-format TX set — **HT20/HT40/VHT20 BCC, HT20 LDPC, HT20 STBC, and
+HT20 2×2 MIMO** — is over-the-air validated against real Realtek silicon.
+
+### TX limitations (current)
+- **STBC / 2×2 MIMO produce two antenna streams**, transmitted over the B210's two
+  synchronized TX channels (see `sdr2wifi`'s `rf_tx_air2.py`). The `frame_builder`
+  block takes an `n_tx` parameter — set it to 2 to emit both antennas (output 0/1 →
+  USRP sink ch0/ch1). STS1 cyclic-shift diversity (CSD) is omitted — not needed for the
+  chip to decode here, but a spec-completeness follow-up.
+- **LDPC TX** is **HT20 MCS 0 only** so far (single R=1/2 n=648 codeword; the
+  multi-codeword / 1296 / 1944 / shorten-puncture-repeat selection and 40 MHz LDPC
+  tone mapping are not yet wired up).
+- **VHT TX** is 20 MHz, NSS = 1, MCS 0–7 (no 256-QAM, no 40/80/160 MHz).
+- The TX↔RX pilot conventions diverged during chip bring-up: the chip-correct TX uses
+  the spec cycling pilots, while this fork's RX (and the synthetic generator in
+  sdr2wifi) still use the older fixed-pilot convention. Aligning the RX to the spec
+  cycling pilots is a pending follow-up.
 
 ## How this relates to the two reference projects
 
@@ -43,15 +96,16 @@ HT MCS > 15. TX of any modern format.
 |---|---|---|---|
 | Lineage | original | fork of bastibl | independent, from scratch (not a bastibl fork) |
 | Language | C++ GNU Radio OOT | same | Python PHY (`phy80211`) + GNU Radio |
-| Formats | 802.11a/g/p (legacy) | + 802.11n HT, 802.11ac VHT (SU), STBC, LDPC — **RX** | 802.11a/n/ac, spec-compliant **TX + RX** |
-| Focus | a working legacy transceiver | blind RX decode for driver/PHY **completeness testing** | a complete, spec-faithful soft-PHY |
+| Formats | 802.11a/g/p (legacy) | + HT/VHT (SU)/LDPC/STBC **RX**; HT20/HT40/VHT20/LDPC/STBC **TX** (all chip-validated) | 802.11a/n/ac, spec-compliant **TX + RX** |
+| Focus | a working legacy transceiver | blind RX decode + chip-compatible TX for driver/PHY **completeness testing** | a complete, spec-faithful soft-PHY |
 | Weight | light | light (minimal extension of upstream) | heavier / more complete |
 
-If you want a complete, spec-compliant 802.11 soft-radio (TX and RX), use
-**GR-WiFi**. If you want a light extension of the classic bastibl C++ receiver that
-blind-decodes HT/VHT frames off the air to check what hardware transmitted, this
-fork is for you. GR-WiFi also makes an excellent *independent* reference TX for
-cross-checking this fork's RX (its PHY shares no code with this one).
+If you want a complete, spec-compliant 802.11 soft-radio (full TX and RX, all
+NSS/bandwidths), use **GR-WiFi**. If you want a light extension of the classic bastibl
+C++ transceiver that blind-decodes HT/VHT frames off the air *and* transmits
+chip-compatible HT/VHT/LDPC frames to check a driver/PHY end to end, this fork is for
+you. GR-WiFi also makes an excellent *independent* reference TX for cross-checking this
+fork's RX (its PHY shares no code with this one).
 
 See [`CLAUDE.md`](CLAUDE.md) for the internal architecture and where each format is
 decoded.
