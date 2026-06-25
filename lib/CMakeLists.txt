@@ -32,6 +32,8 @@ list(APPEND ieee802_11_sources
     ether_encap_impl.cc
     extract_csi_impl.cc
     frame_equalizer_impl.cc
+    frame_builder_impl.cc
+    tx/wifi_tx.cc
     mac.cc
     mapper_impl.cc
     parse_mac.cc

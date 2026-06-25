@@ -1,0 +1,54 @@
+id: ieee802_11_frame_builder
+label: WiFi Frame Builder (HT/VHT TX)
+category: '[IEEE802.11]'
+
+parameters:
+-   id: format
+    label: Format
+    dtype: raw
+    default: ieee802_11.FORMAT_HT
+-   id: mcs
+    label: MCS
+    dtype: int
+    default: '0'
+-   id: bw
+    label: Bandwidth (MHz)
+    dtype: int
+    default: '20'
+-   id: fec
+    label: FEC
+    dtype: raw
+    default: ieee802_11.FEC_BCC
+-   id: debug
+    label: Debug
+    dtype: bool
+    default: 'False'
+    options: ['True', 'False']
+    option_labels: [Enable, Disable]
+
+inputs:
+-   domain: message
+    id: in
+
+outputs:
+-   domain: stream
+    dtype: complex
+    multiplicity: '1'
+
+templates:
+    imports: import ieee802_11
+    make: ieee802_11.frame_builder(${format}, ${mcs}, ${bw}, ${fec}, ${debug})
+    callbacks:
+    - set_format(${format})
+    - set_mcs(${mcs})
+    - set_bw(${bw})
+    - set_fec(${fec})
+
+documentation: |-
+    Modern-format (HT/VHT) TX frame builder. Takes a PSDU as a PDU message on
+    port "in" and emits the finished time-domain frame as a tagged-stream burst
+    of complex samples (packet_len tag), ready for a USRP/file sink. Supports
+    HT20/HT40/VHT20 SISO BCC and HT20 MCS0 LDPC, validated over the air against
+    a Realtek RTL8812AU.
+
+file_format: 1
