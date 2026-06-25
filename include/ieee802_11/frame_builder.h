@@ -37,13 +37,15 @@ public:
 
     /*!
      * \param format  FORMAT_HT or FORMAT_VHT
-     * \param mcs     MCS index (HT 0-7 / VHT 0-7; per-stream)
+     * \param mcs     MCS index (HT 0-7 SISO, 8-15 = 2x2 MIMO; VHT 0-7)
      * \param bw      bandwidth in MHz (20 or 40; VHT 20 only so far)
      * \param fec     FEC_BCC or FEC_LDPC (LDPC: HT20 MCS0 so far)
+     * \param n_tx    number of output streams / TX antennas (1 or 2). Use 2 for STBC
+     *                and 2x2 MIMO (output 0/1 -> USRP sink ch0/ch1).
      * \param debug   verbose logging
      */
     static sptr make(Format format = FORMAT_HT, int mcs = 0, int bw = 20,
-                     FecType fec = FEC_BCC, bool debug = false);
+                     FecType fec = FEC_BCC, int n_tx = 1, bool debug = false);
 
     virtual void set_format(Format format) = 0;
     virtual void set_mcs(int mcs) = 0;

@@ -22,24 +22,24 @@ using namespace gr::ieee802_11;
 class frame_builder_impl : public frame_builder
 {
 public:
-    frame_builder_impl(Format format, int mcs, int bw, FecType fec, bool debug)
+    frame_builder_impl(Format format, int mcs, int bw, FecType fec, int n_tx, bool debug)
         : block("frame_builder",
                 gr::io_signature::make(0, 0, 0),
-                gr::io_signature::make(1, 1, sizeof(gr_complex))),
-          d_format(format), d_mcs(mcs), d_bw(bw), d_fec(fec), d_debug(debug),
-          d_offset(0)
+                gr::io_signature::make(n_tx, n_tx, sizeof(gr_complex))),
+          d_format(format), d_mcs(mcs), d_bw(bw), d_fec(fec),
+          d_ntx(n_tx < 1 ? 1 : (n_tx > 2 ? 2 : n_tx)), d_debug(debug), d_offset(0)
     {
         message_port_register_in(pmt::mp("in"));
+        d_ant.resize(d_ntx);
     }
 
     int general_work(int noutput, gr_vector_int& ninput_items,
                      gr_vector_const_void_star& input_items,
                      gr_vector_void_star& output_items) override
     {
-        gr_complex* out = static_cast<gr_complex*>(output_items[0]);
-
-        // Build the next frame when idle.
-        while (d_samples.empty()) {
+        // Build the next frame when idle. d_ant[k] is antenna k's samples; for 2-output
+        // STBC/MIMO that's the two TX antennas, for SISO antenna 1 (if requested) is 0.
+        while (d_ant[0].empty()) {
             pmt::pmt_t msg(delete_head_nowait(pmt::intern("in")));
             if (!msg.get())
                 return 0;
@@ -58,29 +58,39 @@ public:
             try {
                 gr::thread::scoped_lock lock(d_mutex);
                 auto ants = tx::build_frame(psdu, psdu_len, p);
-                if (!ants.empty())
-                    d_samples = ants[0]; // SISO: single TX stream (STBC/MIMO later)
+                if (!ants.empty()) {
+                    d_ant[0] = ants[0];
+                    if (d_ntx == 2)
+                        d_ant[1] = (ants.size() > 1) ? ants[1]
+                                                     : std::vector<gr_complex>(
+                                                           ants[0].size(), gr_complex(0, 0));
+                }
             } catch (const std::exception& e) {
                 if (d_debug)
                     std::fprintf(stderr, "frame_builder: drop PDU (%s)\n", e.what());
                 continue; // unsupported params -> drop this PDU, keep running
             }
-            if (d_samples.empty())
+            if (d_ant[0].empty())
                 continue;
 
             pmt::pmt_t srcid = pmt::string_to_symbol(alias());
-            add_item_tag(0, nitems_written(0), pmt::mp("packet_len"),
-                         pmt::from_long((long)d_samples.size()), srcid);
-            add_item_tag(0, nitems_written(0), pmt::mp("psdu_len"),
-                         pmt::from_long((long)psdu_len), srcid);
+            for (int ch = 0; ch < d_ntx; ch++) {
+                add_item_tag(ch, nitems_written(ch), pmt::mp("packet_len"),
+                             pmt::from_long((long)d_ant[ch].size()), srcid);
+                add_item_tag(ch, nitems_written(ch), pmt::mp("psdu_len"),
+                             pmt::from_long((long)psdu_len), srcid);
+            }
             d_offset = 0;
         }
 
-        int n = std::min<int>(noutput, (int)d_samples.size() - d_offset);
-        std::memcpy(out, d_samples.data() + d_offset, n * sizeof(gr_complex));
+        int n = std::min<int>(noutput, (int)d_ant[0].size() - d_offset);
+        for (int ch = 0; ch < d_ntx; ch++)
+            std::memcpy(static_cast<gr_complex*>(output_items[ch]),
+                        d_ant[ch].data() + d_offset, n * sizeof(gr_complex));
         d_offset += n;
-        if (d_offset == (int)d_samples.size()) {
-            d_samples.clear();
+        if (d_offset == (int)d_ant[0].size()) {
+            for (auto& a : d_ant)
+                a.clear();
             d_offset = 0;
         }
         return n;
@@ -102,15 +112,16 @@ private:
     int d_mcs;
     int d_bw;
     FecType d_fec;
+    int d_ntx;
     bool d_debug;
-    std::vector<gr_complex> d_samples;
+    std::vector<std::vector<gr_complex>> d_ant;
     int d_offset;
     gr::thread::mutex d_mutex;
 };
 
 frame_builder::sptr frame_builder::make(Format format, int mcs, int bw, FecType fec,
-                                        bool debug)
+                                        int n_tx, bool debug)
 {
     return gnuradio::get_initial_sptr(
-        new frame_builder_impl(format, mcs, bw, fec, debug));
+        new frame_builder_impl(format, mcs, bw, fec, n_tx, debug));
 }

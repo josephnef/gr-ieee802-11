@@ -44,6 +44,7 @@ void bind_frame_builder(py::module& m)
              py::arg("mcs") = 0,
              py::arg("bw") = 20,
              py::arg("fec") = ::gr::ieee802_11::FEC_BCC,
+             py::arg("n_tx") = 1,
              py::arg("debug") = false,
              D(frame_builder, make))
 

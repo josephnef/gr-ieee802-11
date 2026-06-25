@@ -19,6 +19,10 @@ parameters:
     label: FEC
     dtype: raw
     default: ieee802_11.FEC_BCC
+-   id: n_tx
+    label: TX antennas
+    dtype: int
+    default: '1'
 -   id: debug
     label: Debug
     dtype: bool
@@ -33,11 +37,11 @@ inputs:
 outputs:
 -   domain: stream
     dtype: complex
-    multiplicity: '1'
+    multiplicity: ${n_tx}
 
 templates:
     imports: import ieee802_11
-    make: ieee802_11.frame_builder(${format}, ${mcs}, ${bw}, ${fec}, ${debug})
+    make: ieee802_11.frame_builder(${format}, ${mcs}, ${bw}, ${fec}, ${n_tx}, ${debug})
     callbacks:
     - set_format(${format})
     - set_mcs(${mcs})
