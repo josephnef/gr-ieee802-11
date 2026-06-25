@@ -62,14 +62,13 @@ decoded with FCS = 0 at the expected DESC_RATE/bw/ldpc):
 - **VHT20** SU SISO BCC, MCS 0–7
 - **HT20 LDPC**, MCS 0 (R=1/2 n=648; header-only GF(2) systematic encoder in
   `lib/ldpc_encoder.h`, round-trip tested against the in-tree min-sum decoder)
+- **HT20 STBC**, MCS 0–7 (1 SS → 2 STS Alamouti, transmitted from two synchronized
+  B210 channels). The chip's STBC convention was reverse-engineered by transmitting
+  STBC *with the chip itself* and separating its two TX streams from a 2-channel B210
+  capture — that's how the HT-LTF P-matrix bug (`[[1,1],[-1,1]]` vs the standard
+  `[[1,-1],[1,1]]`) was found.
 
 ### TX limitations (current)
-
-- **STBC** (1 SS → 2 STS Alamouti) is implemented and the DSP is **bit-validated via
-  the fork's own RX self-loop** (Alamouti + P-matrix HT-LTF + framing decode to
-  CRC-32 PASS), but it is **not yet validated over the air**: synchronized 2-channel
-  B210 transmit + cyclic-shift diversity (CSD) are still being worked out. Treat STBC
-  TX as experimental.
 - **2×2 MIMO TX** (HT MCS 8–15) is **not implemented** (RX-only).
 - **LDPC TX** is **HT20 MCS 0 only** so far (single R=1/2 n=648 codeword; the
   multi-codeword / 1296 / 1944 / shorten-puncture-repeat selection and 40 MHz LDPC
@@ -86,7 +85,7 @@ decoded with FCS = 0 at the expected DESC_RATE/bw/ldpc):
 |---|---|---|---|
 | Lineage | original | fork of bastibl | independent, from scratch (not a bastibl fork) |
 | Language | C++ GNU Radio OOT | same | Python PHY (`phy80211`) + GNU Radio |
-| Formats | 802.11a/g/p (legacy) | + HT/VHT (SU)/LDPC/STBC **RX**; HT20/HT40/VHT20/LDPC **TX** (chip-validated), STBC TX experimental | 802.11a/n/ac, spec-compliant **TX + RX** |
+| Formats | 802.11a/g/p (legacy) | + HT/VHT (SU)/LDPC/STBC **RX**; HT20/HT40/VHT20/LDPC/STBC **TX** (all chip-validated) | 802.11a/n/ac, spec-compliant **TX + RX** |
 | Focus | a working legacy transceiver | blind RX decode + chip-compatible TX for driver/PHY **completeness testing** | a complete, spec-faithful soft-PHY |
 | Weight | light | light (minimal extension of upstream) | heavier / more complete |
 
