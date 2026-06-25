@@ -48,10 +48,12 @@ int main(int argc, char** argv)
     int bw = argc > 4 ? atoi(argv[4]) : 20;
 
     tx::tx_params p;
-    // "ldpc" selects HT20 MCS0 LDPC; "stbc" selects HT20 1->2 STBC; else BCC HT/VHT.
-    p.format = (fmt == "vht") ? tx::TX_VHT : tx::TX_HT;
+    // "ldpc" selects HT20 MCS0 LDPC; "stbc" selects HT20 1->2 STBC; "vht"/"vht2" = VHT
+    // SU NSS=1 / NSS=2; else BCC HT.
+    p.format = (fmt == "vht" || fmt == "vht2") ? tx::TX_VHT : tx::TX_HT;
     p.fec = (fmt == "ldpc") ? tx::TX_LDPC : tx::TX_BCC;
     p.stbc = (fmt == "stbc") ? 1 : 0;
+    p.n_ss = (fmt == "vht2") ? 2 : 1;
     // "mimo" = 2x2 HT MIMO; the per-stream MCS arg maps to HT MCS 8+mcs.
     p.mcs = (fmt == "mimo") ? 8 + mcs : mcs;
     p.bw = bw;
