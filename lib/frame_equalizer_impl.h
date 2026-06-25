@@ -65,6 +65,21 @@ private:
     bool try_ht_sig(const gr_complex* eq, int& mcs, int& cbw, int& len, int& stbc,
                     int& fec, int& sgi);
 
+    // --- 802.11ac VHT (SU, 20 MHz, NSS=1, MCS 0-7, BCC) ---
+    // VHT-SIG-A is the same 2-symbol BCC-coded field as HT-SIG, but symbol 3 is
+    // BPSK (not QBPSK) and the field layout + CRC content differ. We feed the SAME
+    // equalized 96 values as try_ht_sig (pilot derotation absorbs the BPSK/QBPSK
+    // rotation) and re-interpret the 48 info bits with the VHT-SIG-A map. VHT-SIG-A
+    // carries no length, so the PSDU length comes from VHT-SIG-B at symbol 7.
+    bool try_vht_sig(const gr_complex* eq, int& mcs, int& bw, int& stbc, int& fec,
+                     int& sgi, int& nss);
+    void vht_read_sig_b(const gr_complex* raw); // sym7: APEP length -> vht_begin
+    void vht_begin(int mcs, int len);           // reuses the HT20 data machinery
+    bool d_vht_pending = false; // VHT-SIG-A validated at sym4, awaiting SIG-B length
+    bool d_vht = false;         // the active HT-data decode is really VHT (offset+log)
+    int d_vht_mcs = 0;
+    int d_vht_nss = 1;
+
     int d_fft_len;              // 64 (20 MHz) or 128 (HT40)
     gr_complex d_ht_raw[2][128]; // raw FFT bins of the 2 candidate HT-SIG symbols
     double d_er_frozen;         // residual-CFO estimate frozen at L-SIG (pre HT-SIG)
@@ -77,8 +92,10 @@ private:
     void ht_data_symbol(const gr_complex* raw, int sym_idx);
     void ht_finish();
     void ht_estimate_ltf40(const gr_complex* raw); // HT40 channel est from HT-LTF
+    void ht_estimate_ltf20(const gr_complex* raw); // HT20 channel est from HT-LTF
     gr_complex d_ht_h[128];   // HT40 data channel estimate (from the HT-LTF)
     bool d_ht_active = false;
+    bool d_ht_fec = false; // true = this HT frame's data is LDPC (else BCC/Viterbi)
     int d_ht_mcs = 0;
     int d_ht_len = 0;
     int d_ht_nsym = 0;   // number of HT DATA OFDM symbols
@@ -103,6 +120,22 @@ private:
     void mimo_estimate_ltf();
     void mimo_data_symbol(const gr_complex* r0, const gr_complex* r1, int sym_idx);
     void mimo_finish();
+
+    // --- 802.11n HT STBC (1 spatial stream -> 2 space-time streams, Alamouti) ---
+    // Detected when HT-SIG reports STBC=1 (SISO, 1 RX antenna). The 2 HT-LTF symbols
+    // (P matrix) give the two STS channels h0,h1 on the single antenna; data OFDM
+    // symbols arrive in PAIRS and are Alamouti-combined (cross-terms cancel, diversity
+    // order 2), then demapped/deinterleaved/Viterbi-decoded like SISO HT.
+    void stbc_begin(int mcs, int len);
+    void stbc_estimate_ltf();
+    void stbc_data_symbol(const gr_complex* raw, int sym_idx); // reuses ht_finish
+    bool d_stbc_active = false;
+    gr_complex d_stbc_ltf[2][64];  // raw FFT of the 2 HT-LTF symbols (one antenna)
+    int d_stbc_ltf_seen = 0;
+    gr_complex d_stbc_h0[64], d_stbc_h1[64]; // the two STS channel estimates
+    gr_complex d_stbc_y0[64];      // buffered first symbol of the current Alamouti pair
+    int d_stbc_y0_sym = 0;         // its symbol index (for derotation)
+    bool d_stbc_have_y0 = false;
 
     equalizer::base* d_equalizer;
     gr::thread::mutex d_mutex;

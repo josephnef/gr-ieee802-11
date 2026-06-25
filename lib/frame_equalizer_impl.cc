@@ -21,6 +21,7 @@
 #include "equalizer/ls.h"
 #include "equalizer/sta.h"
 #include "frame_equalizer_impl.h"
+#include "ldpc_min_sum.h"
 #include "utils.h"
 #include <gnuradio/io_signature.h>
 #include <boost/crc.hpp>
@@ -166,10 +167,18 @@ int frame_equalizer_impl::general_work(int noutput_items,
         if (tags.size()) {
             d_ht_active = false;
             d_mimo_active = false;
+            d_vht_pending = false;
+            d_vht = false;
+            d_stbc_active = false;
+            d_stbc_ltf_seen = 0;
+            d_stbc_have_y0 = false;
+            d_ht_fec = false;
         }
 
-        // not interesting -> skip (but keep going while an HT/MIMO frame is decoding)
-        if (d_current_symbol > (d_frame_symbols + 2) && !d_ht_active && !d_mimo_active) {
+        // not interesting -> skip (but keep going while an HT/MIMO/VHT/STBC frame is
+        // decoding or a VHT-SIG-B length read is still pending)
+        if (d_current_symbol > (d_frame_symbols + 2) && !d_ht_active &&
+            !d_mimo_active && !d_vht_pending && !d_stbc_active) {
             i++;
             continue;
         }
@@ -187,6 +196,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
         } else if (d_current_symbol == 4) {
             std::memcpy(d_ht_raw[1], in + i * fft, fft * sizeof(gr_complex));
         }
+
 
         // compensate sampling offset
         for (int k = 0; k < fft; k++) {
@@ -259,8 +269,21 @@ int frame_equalizer_impl::general_work(int noutput_items,
         if (d_ht_active && fft == 128 && d_current_symbol == 6) {
             ht_estimate_ltf40(in + i * fft);
         }
-        // HT DATA symbols start after L-SIG(2), HT-SIG(3,4), HT-STF(5), HT-LTF(6).
-        if (d_ht_active && d_current_symbol >= 7) {
+        // HT20 estimates its data channel from the HT-LTF (sym6) too -- get_h() is
+        // corrupted by the QBPSK HT-SIG tracking on real frames. (VHT, whose
+        // d_ht_active isn't set until sym7, keeps get_h() in ht_data_symbol.)
+        if (d_ht_active && fft == 64 && !d_vht && d_current_symbol == 6) {
+            ht_estimate_ltf20(in + i * fft);
+        }
+        // VHT: read the PSDU length from VHT-SIG-B (sym7), then start the data
+        // decode. This sets d_ht_active + d_vht, so it must run before the HT-data
+        // dispatch below (whose VHT offset then skips sym7 itself).
+        if (d_vht_pending && d_current_symbol == 7) {
+            vht_read_sig_b(in + i * fft);
+        }
+        // HT DATA starts after L-SIG(2), HT-SIG(3,4), HT-STF(5), HT-LTF(6) at sym7.
+        // VHT DATA starts one symbol later (sym8) because VHT-SIG-B occupies sym7.
+        if (d_ht_active && d_current_symbol >= (d_vht ? 8 : 7)) {
             ht_data_symbol(in + i * fft, d_current_symbol);
         }
 
@@ -276,6 +299,19 @@ int frame_equalizer_impl::general_work(int noutput_items,
         }
         if (d_mimo_active && d_current_symbol >= 8) {
             mimo_data_symbol(in + i * fft, in1 + i * fft, d_current_symbol);
+        }
+
+        // HT STBC (1 SS -> 2 STS): the 2 HT-LTF symbols (6,7) give h0,h1 on the single
+        // antenna via the P matrix; Alamouti data starts at symbol 8.
+        if (d_stbc_active && (d_current_symbol == 6 || d_current_symbol == 7)) {
+            std::memcpy(d_stbc_ltf[d_current_symbol - 6], in + i * fft,
+                        64 * sizeof(gr_complex));
+            if (++d_stbc_ltf_seen == 2) {
+                stbc_estimate_ltf();
+            }
+        }
+        if (d_stbc_active && d_current_symbol >= 8) {
+            stbc_data_symbol(in + i * fft, d_current_symbol);
         }
 
         // signal field
@@ -473,13 +509,17 @@ void frame_equalizer_impl::equalize_ht_sig(const gr_complex* raw,
     const int dc = d_fft_len / 2;
     const int slen = d_fft_len + d_fft_len / 4;
     gr_complex eqd[128];
+    // NOTE: the per-subcarrier sampling-offset ramp (d_epsilon0 = CFO/f_carrier)
+    // assumes the TX and RX share a reference oscillator -- valid for two radios on
+    // one board, but FALSE when an SDR captures an independent transmitter (the B210
+    // sample clock and the chip LO are unrelated, so eps0 derived from CFO is a bogus
+    // SFO). Applying it injects a spurious linear phase that flips HT-SIG band-edge
+    // bits (the CRC-8 has no FEC margin). The true SFO is negligible over the 3-4
+    // symbols from L-LTF to HT-SIG, so we drop the ramp here. (DISABLE_HT_SIG_RAMP)
     for (int i = 6; i <= 58; i++) {
-        gr_complex r = raw[i] * exp(gr_complex(0,
-                                               2 * M_PI * sym_idx * slen *
-                                                   (d_epsilon0 + d_er_frozen) *
-                                                   (i - dc) / d_fft_len));
-        eqd[i] = r / h[i];
+        eqd[i] = raw[i] / h[i];
     }
+    (void)slen;
     // Common-phase derotation from the 4 HT-SIG pilots {11,25,39,53}, which are
     // QBPSK {+1,+1,+1,-1}*Pn*j. Using the known pilots (not a blind square)
     // resolves the phase unambiguously and is robust to sync-alignment jitter --
@@ -546,7 +586,8 @@ bool frame_equalizer_impl::try_ht_sig(const gr_complex* eq,
     for (int i = 0; i < 8; i++) {
         crc_msb |= bits[34 + i] << (7 - i); // CRC transmitted MSB-first (c7..c0)
     }
-    return (crc_calc == crc_msb) && mcs <= 31 && len >= 1 && len <= 4095 && fec == 0;
+    // fec (BCC vs LDPC) is returned for the caller to dispatch on -- not gated here.
+    return (crc_calc == crc_msb) && mcs <= 31 && len >= 1 && len <= 4095;
 }
 
 void frame_equalizer_impl::sniff_ht_sig()
@@ -566,7 +607,46 @@ void frame_equalizer_impl::sniff_ht_sig()
     equalize_ht_sig(d_ht_raw[1], 4, h, eq + 48);
 
     int mcs, cbw, len, stbc, fec, sgi;
-    if (try_ht_sig(eq, mcs, cbw, len, stbc, fec, sgi)) {
+
+    // Real 802.11 HT-SIG / VHT-SIG-A carry BPSK pilots + QBPSK data, so after
+    // pilot-phase derotation the QBPSK data lands on the IMAGINARY axis (verified
+    // against real Realtek frames: a clean 6M-L-SIG beacon decodes to its true MCS
+    // only on the imag axis). The synthetic generator instead rotates the pilots too,
+    // landing data on the REAL axis. Decode robustly by trying the real axis first
+    // (matches the synthetic harness) then the imaginary axis -- rotating eq by -j so
+    // try_*_sig's real-axis slicer reads the imaginary component.
+    gr_complex eq_q[96];
+    for (int k = 0; k < 96; k++) {
+        eq_q[k] = eq[k] * gr_complex(0, -1);
+    }
+
+    bool ht_ok = try_ht_sig(eq, mcs, cbw, len, stbc, fec, sgi) ||
+                 try_ht_sig(eq_q, mcs, cbw, len, stbc, fec, sgi);
+
+    if (d_debug) {
+        // Per-sniff diagnostic for over-air HT-SIG bring-up: axis-agnostic coherence of
+        // the raw-equalized SIG (|mean(d^2)|/mean|d|^2; ~1 = clean symbols, ~0 = bad
+        // sync/FFT-window) plus each axis's decode. Gated; no effect on dispatch.
+        static int dbg_n = 0;
+        gr_complex acc2 = 0;
+        double pwr = 0;
+        for (int i = 6; i <= 58; i++) {
+            if (i == 11 || i == 25 || i == 32 || i == 39 || i == 53)
+                continue;
+            gr_complex d = d_ht_raw[0][i] / h[i];
+            acc2 += d * d;
+            pwr += std::norm(d);
+        }
+        int m0, c0, l0, s0, f0, g0, m1, c1, l1, s1, f1, g1;
+        bool a0 = try_ht_sig(eq, m0, c0, l0, s0, f0, g0);
+        bool a1 = try_ht_sig(eq_q, m1, c1, l1, s1, f1, g1);
+        std::cerr << "[ht-dbg] sniff#" << ++dbg_n
+                  << " rawCoh=" << std::abs(acc2) / (pwr + 1e-9)
+                  << " real{ok=" << a0 << " mcs=" << m0 << "}"
+                  << " imag{ok=" << a1 << " mcs=" << m1 << "}" << std::endl;
+    }
+
+    if (ht_ok) {
         std::cout << "[HT-SIG] CRC-OK mcs=" << mcs << " cbw" << (cbw ? 40 : 20)
                   << " len=" << len << " stbc=" << stbc
                   << " fec=" << (fec ? "LDPC" : "BCC") << " sgi=" << sgi << std::endl;
@@ -580,6 +660,156 @@ void frame_equalizer_impl::sniff_ht_sig()
         if (cbw == want_cbw && stbc == 0 && fec == 0) {
             ht_begin(mcs, len);
         }
+        // HT STBC (1 SS -> 2 STS Alamouti), HT20 SISO, BCC, MCS 0-7.
+        else if (d_fft_len == 64 && cbw == 0 && stbc == 1 && fec == 0 && mcs <= 7) {
+            stbc_begin(mcs, len);
+        }
+        // HT LDPC (R=1/2 n=648, single codeword, BPSK MCS0): collect the data bits
+        // like BCC, then run the min-sum LDPC decoder in ht_finish.
+        else if (d_fft_len == 64 && cbw == 0 && stbc == 0 && fec == 1 && mcs == 0) {
+            ht_begin(mcs, len);
+            if (d_ht_active) {
+                d_ht_fec = true;
+                d_ht_nsym = 13; // ceil(648 / 52) BPSK data symbols for one codeword
+            }
+        }
+        return;
+    }
+
+    // Not HT -> try VHT-SIG-A. VHT20 SISO only on the 64-FFT block. Spec VHT-SIG-A is
+    // MIXED-axis: A1 BPSK (real axis), A2 QBPSK (imag axis) -- verified against
+    // GR-WiFi's spec generator AND matched by our (now spec-compliant) synthetic
+    // generator. eq_mix carries symbol-1 from eq (real) and symbol-2 from eq_q (imag).
+    // A SINGLE attempt (not a blind multi-axis trial) keeps the CRC-8 false-positive
+    // surface minimal so the synthetic regression stays stable.
+    gr_complex eq_mix[96];
+    for (int k = 0; k < 48; k++) {
+        eq_mix[k] = eq[k];             // VHT-SIG-A1: real axis
+        eq_mix[48 + k] = eq_q[48 + k]; // VHT-SIG-A2: imag axis (eq_q = eq * -j)
+    }
+    int vmcs, vbw, vstbc, vfec, vsgi, vnss;
+    if (d_fft_len == 64 &&
+        try_vht_sig(eq_mix, vmcs, vbw, vstbc, vfec, vsgi, vnss)) {
+        std::cout << "[VHT-SIG-A] CRC-OK mcs=" << vmcs << " nss=" << vnss
+                  << " bw" << (20 << vbw) << " stbc=" << vstbc
+                  << " fec=" << (vfec ? "LDPC" : "BCC") << " sgi=" << vsgi << std::endl;
+        // First cut: SU, 20 MHz, single stream, BCC, MCS 0-7. The PSDU length is
+        // not in VHT-SIG-A; defer the data decode until VHT-SIG-B (sym7).
+        if (vbw == 0 && vnss == 1 && vstbc == 0 && vfec == 0 && vmcs <= 7) {
+            d_vht_pending = true;
+            d_vht_mcs = vmcs;
+            d_vht_nss = vnss;
+        }
+    }
+}
+
+// Decode the two equalized SIG symbols as VHT-SIG-A (SU). The BCC decode is
+// identical to try_ht_sig (same 96 -> 48); only the field map + validity differ.
+// VHT-SIG-A1(24): B0-1 BW, B3 STBC, B10-12 NSTS(=NSS-1).  VHT-SIG-A2(24): B0 SGI,
+// B2 coding(0=BCC), B4-7 VHT-MCS, B10-17 CRC-8 over B0..B33.
+bool frame_equalizer_impl::try_vht_sig(const gr_complex* eq,
+                                       int& mcs,
+                                       int& bw,
+                                       int& stbc,
+                                       int& fec,
+                                       int& sgi,
+                                       int& nss)
+{
+    uint8_t coded[96];
+    for (int s = 0; s < 2; s++) {
+        uint8_t raw[48];
+        for (int c = 0; c < 48; c++) {
+            raw[c] = std::real(eq[s * 48 + c]) > 0 ? 1 : 0;
+        }
+        for (int i = 0; i < 48; i++) {
+            coded[s * 48 + i] = raw[interleaver_pattern[i]];
+        }
+    }
+    static ofdm_param ofdm(BPSK_1_2);
+    static frame_param frame(ofdm, 0);
+    frame.n_sym = 2;
+    frame.n_data_bits = 48;
+    frame.n_encoded_bits = 96;
+    frame.psdu_size = 0;
+    frame.n_pad = 0;
+    uint8_t* bits = d_decoder.decode(&ofdm, &frame, coded);
+
+    bw = bits[0] | (bits[1] << 1);
+    stbc = bits[3];
+    nss = (bits[10] | (bits[11] << 1) | (bits[12] << 2)) + 1; // NSTS+1
+    sgi = bits[24];
+    fec = bits[26];
+    mcs = bits[28] | (bits[29] << 1) | (bits[30] << 2) | (bits[31] << 3);
+
+    uint8_t crc_calc = ht_sig_crc8(bits, 34);
+    int crc_msb = 0;
+    for (int i = 0; i < 8; i++) {
+        crc_msb |= bits[34 + i] << (7 - i);
+    }
+    return (crc_calc == crc_msb) && mcs <= 9 && nss >= 1 && nss <= 4;
+}
+
+// VHT-SIG-B (sym7, 20 MHz SU): BPSK over the 52 data tones, BCC rate-1/2 (52 coded
+// -> 26 info, no interleave in this harness). B0-16 = APEP-Length in 4-octet units.
+// Recovers the PSDU length VHT-SIG-A lacks, then starts the VHT data decode.
+void frame_equalizer_impl::vht_read_sig_b(const gr_complex* raw)
+{
+    const gr_complex* h = d_equalizer->get_h();
+    const int slen = d_fft_len + d_fft_len / 4;
+    gr_complex eqd[64];
+    for (int i = 4; i <= 60; i++) {
+        gr_complex hi = h[i];
+        if (i < 6) {
+            hi = h[6];
+        } else if (i > 58) {
+            hi = h[58];
+        }
+        gr_complex r = raw[i] * exp(gr_complex(0,
+                                               2 * M_PI * 7 * slen *
+                                                   (d_epsilon0 + d_er_frozen) *
+                                                   (i - 32) / d_fft_len));
+        eqd[i] = r / hi;
+    }
+    gr_complex p = equalizer::base::POLARITY[(7 - 2) % 127];
+    gr_complex acc = (eqd[11] + eqd[25] + eqd[39] - eqd[53]) * p;
+    gr_complex derot = std::polar(1.0f, (float)(-std::arg(acc)));
+
+    uint8_t coded[52];
+    int c = 0;
+    for (int i = 4; i <= 60; i++) {
+        if (i == 11 || i == 25 || i == 32 || i == 39 || i == 53) {
+            continue;
+        }
+        coded[c++] = std::real(eqd[i] * derot) > 0 ? 1 : 0;
+    }
+    static ofdm_param ofdm(BPSK_1_2);
+    static frame_param frame(ofdm, 0);
+    frame.n_sym = 1;
+    frame.n_data_bits = 26;
+    frame.n_encoded_bits = 52;
+    frame.psdu_size = 0;
+    frame.n_pad = 0;
+    uint8_t* bits = d_decoder.decode(&ofdm, &frame, coded);
+    int apep = 0;
+    for (int i = 0; i < 17; i++) {
+        apep |= bits[i] << i;
+    }
+    int len = apep * 4;
+    d_vht_pending = false;
+    if (len >= 1 && len <= 4095) {
+        vht_begin(d_vht_mcs, len);
+    }
+}
+
+// Start the VHT data decode. VHT20 NSS=1 MCS 0-7 data is identical to HT20 MCS 0-7
+// (52 SC, same constellations + interleaver), so reuse ht_begin's machinery via the
+// equivalent HT encoding; d_vht just shifts the data start (+1 for VHT-SIG-B) and
+// the finish log.
+void frame_equalizer_impl::vht_begin(int mcs, int len)
+{
+    ht_begin(mcs, len); // sets d_ht_active + d_ht_* using HT_MCS_0+mcs, bw=20
+    if (d_ht_active) {
+        d_vht = true;
     }
 }
 
@@ -610,6 +840,7 @@ void frame_equalizer_impl::ht_begin(int mcs, int len)
         return;
     }
     d_ht_active = true;
+    d_ht_fec = false; // BCC by default; the LDPC dispatch flips this on
     d_ht_mcs = mcs;
     d_ht_len = len;
     d_ht_nsym = frame.n_sym;
@@ -638,25 +869,47 @@ void frame_equalizer_impl::ht_estimate_ltf40(const gr_complex* raw)
     }
 }
 
-// Equalize + demap one HT DATA OFDM symbol (raw FFT), appending n_cbps coded
-// bits, with pilot-based common-phase correction. HT20 reuses the L-LTF channel
-// (edge carriers extrapolated); HT40 uses the HT-LTF estimate (d_ht_h).
+// HT20 channel estimate from the HT-LTF (sym6): 64-FFT analogue of ht_estimate_ltf40
+// over the HTLTF20 occupied bins (L-LTF tones + the HT edge tones +-27,+-28). Real
+// Realtek HT frames need this -- the legacy get_h() is corrupted by the QBPSK HT-SIG
+// pilot tracking (measured: it left ~57% EVM on real data; the HT-LTF estimate ~30%).
+void frame_equalizer_impl::ht_estimate_ltf20(const gr_complex* raw)
+{
+    const int dc = 32, slen = 80;
+    for (int i = 0; i < 64; i++) {
+        gr_complex ref = equalizer::base::HTLTF20[i];
+        if (ref == gr_complex(0, 0)) {
+            continue;
+        }
+        gr_complex r = raw[i] * exp(gr_complex(0,
+                                               2 * M_PI * 6 * slen *
+                                                   (d_epsilon0 + d_er_frozen) *
+                                                   (i - dc) / 64));
+        d_ht_h[i] = r / ref;
+    }
+}
+
+// Equalize + demap one HT DATA OFDM symbol (raw FFT), appending n_cbps coded bits,
+// with pilot-based common-phase correction. HT (20 + 40) uses the HT-LTF channel
+// estimate (d_ht_h, covers the edge tones); VHT keeps the legacy L-LTF channel
+// (get_h) with edge extrapolation, since VHT estimates no d_ht_h at sym6.
 void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
 {
     const bool ht40 = (d_fft_len == 128);
     const int dc = d_fft_len / 2;
     const int slen = d_fft_len + d_fft_len / 4;
-    const gr_complex* h = ht40 ? d_ht_h : d_equalizer->get_h();
+    const bool use_lltf = d_vht;
+    const gr_complex* h = use_lltf ? d_equalizer->get_h() : d_ht_h;
 
     gr_complex eqd[128];
     const int lo = ht40 ? 6 : 4;
     const int hi_bin = ht40 ? 122 : 60;
     for (int i = lo; i <= hi_bin; i++) {
         gr_complex hi = h[i];
-        if (!ht40 && i < 6) {
-            hi = h[6]; // HT20 edge carriers (-28,-27) not in L-LTF
-        } else if (!ht40 && i > 58) {
-            hi = h[58]; // HT20 edge carriers (27,28)
+        if (use_lltf && i < 6) {
+            hi = h[6]; // VHT/L-LTF edge carriers (-28,-27) not in L-LTF
+        } else if (use_lltf && i > 58) {
+            hi = h[58]; // VHT/L-LTF edge carriers (27,28)
         }
         gr_complex r = raw[i] * exp(gr_complex(0,
                                                2 * M_PI * sym_idx * slen *
@@ -706,6 +959,39 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
 
 void frame_equalizer_impl::ht_finish()
 {
+    // LDPC path: the collected data bits (in tone order, no BCC interleave) hold one
+    // R=1/2 n=648 codeword in the first 648 positions. Min-sum decode it, take the
+    // first 324 columns as the info block (SERVICE + scrambled PSDU), descramble, FCS.
+    if (d_ht_fec) {
+        float llr[648];
+        for (int i = 0; i < 648; i++) {
+            llr[i] = d_ht_rx_bits[i] ? -1.0f : 1.0f; // bit1 -> -1, bit0 -> +1
+        }
+        uint8_t cw[648];
+        ldpc_decode_648(llr, cw);
+        int state = 0;
+        for (int i = 0; i < 7; i++) {
+            if (cw[i]) {
+                state |= 1 << (6 - i);
+            }
+        }
+        static uint8_t lb[MAX_PSDU_SIZE + 2];
+        std::memset(lb, 0, d_ht_len + 2);
+        lb[0] = state;
+        for (int i = 7; i < d_ht_len * 8 + 16; i++) {
+            int fb = (!!(state & 64)) ^ (!!(state & 8));
+            lb[i / 8] |= (fb ^ (cw[i] & 0x1)) << (i % 8);
+            state = ((state << 1) & 0x7e) | fb;
+        }
+        boost::crc_32_type lcrc;
+        lcrc.process_bytes(lb + 2, d_ht_len);
+        bool lok = (lcrc.checksum() == 558161692);
+        std::cout << "[LDPC-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
+                  << " (R1/2 n=648)  CRC-32 " << (lok ? "PASS" : "fail") << std::endl;
+        d_ht_fec = false;
+        return;
+    }
+
     const int bw = (d_fft_len == 128) ? 40 : 20;
     ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + d_ht_mcs), bw);
     frame_param frame(ofdm, d_ht_len);
@@ -745,13 +1031,26 @@ void frame_equalizer_impl::ht_finish()
         state = ((state << 1) & 0x7e) | fb;
     }
 
-    // CRC-32 over the PSDU (skip the 2-byte SERVICE field)
+    // CRC-32 over the PSDU (skip the 2-byte SERVICE field). The check value is the
+    // CRC-32/ISO-HDLC residue (0x2144DF1C): running the CRC over [MPDU || its FCS]
+    // yields it for ANY payload, so this is a genuine per-frame FCS check.
     boost::crc_32_type crc;
     crc.process_bytes(out_bytes + 2, d_ht_len);
     bool ok = (crc.checksum() == 558161692);
-    std::cout << "[HT-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
-              << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
-              << std::endl;
+    if (d_stbc_active) {
+        std::cout << "[STBC-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
+                  << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
+                  << std::endl;
+    } else if (d_vht) {
+        std::cout << "[VHT-DATA] mcs=" << d_ht_mcs << " nss=" << d_vht_nss
+                  << " len=" << d_ht_len << " nsym=" << d_ht_nsym << "  CRC-32 "
+                  << (ok ? "PASS" : "fail") << std::endl;
+        d_vht = false;
+    } else {
+        std::cout << "[HT-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
+                  << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
+                  << std::endl;
+    }
 }
 
 // ---- 802.11n 2x2 MIMO (MCS 8-15, HT20) ----------------------------------------
@@ -917,6 +1216,130 @@ void frame_equalizer_impl::mimo_finish()
     std::cout << "[HT-MIMO] mcs=" << (d_ht_mcs + 8) << " (2x2) len=" << d_ht_len
               << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
               << std::endl;
+}
+
+// ---- 802.11n HT STBC (1 SS -> 2 STS Alamouti, HT20, 1 RX antenna) -------------
+
+void frame_equalizer_impl::stbc_begin(int mcs, int len)
+{
+    ofdm_param ofdm(Encoding(gr::ieee802_11::HT_MCS_0 + mcs), 20);
+    frame_param frame(ofdm, len);
+    int nsym = frame.n_sym;
+    if (nsym & 1) {
+        nsym++; // Alamouti needs an even number of OFDM symbols (symbol pairs)
+    }
+    if (nsym <= 0 || nsym > MAX_SYM || nsym * ofdm.n_cbps > MAX_ENCODED_BITS) {
+        return;
+    }
+    d_stbc_active = true;
+    d_stbc_ltf_seen = 0;
+    d_stbc_have_y0 = false;
+    d_ht_mcs = mcs;
+    d_ht_len = len;
+    d_ht_nsym = nsym;
+    d_ht_dsym = 0;
+    d_ht_nbpsc = ofdm.n_bpsc;
+    d_ht_ncbps = ofdm.n_cbps;
+    d_ht_ndbps = ofdm.n_dbps;
+}
+
+// Estimate the two STS channels h0,h1 from the 2 HT-LTF symbols (P matrix) on the
+// single antenna: y0 = (h0 - h1)*HTLTF20, y1 = (h0 + h1)*HTLTF20  (P2 rows {1,-1}/{1,1})
+// -> h0 = (a + b)/2, h1 = (b - a)/2 with a = y0/ref, b = y1/ref.
+void frame_equalizer_impl::stbc_estimate_ltf()
+{
+    const int dc = 32, slen = 80;
+    for (int i = 0; i < 64; i++) {
+        gr_complex ref = equalizer::base::HTLTF20[i];
+        if (ref == gr_complex(0, 0)) {
+            d_stbc_h0[i] = d_stbc_h1[i] = gr_complex(0, 0);
+            continue;
+        }
+        gr_complex a = d_stbc_ltf[0][i] *
+                       exp(gr_complex(0, 2 * M_PI * 6 * slen *
+                                             (d_epsilon0 + d_er_frozen) * (i - dc) / 64)) /
+                       ref;
+        gr_complex b = d_stbc_ltf[1][i] *
+                       exp(gr_complex(0, 2 * M_PI * 7 * slen *
+                                             (d_epsilon0 + d_er_frozen) * (i - dc) / 64)) /
+                       ref;
+        d_stbc_h0[i] = (a + b) * gr_complex(0.5f, 0);
+        d_stbc_h1[i] = (b - a) * gr_complex(0.5f, 0);
+    }
+}
+
+// One HT STBC DATA symbol. Symbols arrive in pairs: buffer the first (y0), and on
+// the second (y1) Alamouti-combine per subcarrier to recover the pair (s0,s1):
+//   s0 = (h0* y0 + h1 y1*) / g ;  s1 = -conj((h1* y0 - h0 y1*) / g) ;  g=|h0|^2+|h1|^2
+// then demap both recovered symbols into the coded-bit buffer.
+void frame_equalizer_impl::stbc_data_symbol(const gr_complex* raw, int sym_idx)
+{
+    const int dc = 32, slen = 80;
+    gr_complex y[64];
+    for (int i = 4; i <= 60; i++) {
+        y[i] = raw[i] * exp(gr_complex(0, 2 * M_PI * sym_idx * slen *
+                                              (d_epsilon0 + d_er_frozen) * (i - dc) / 64));
+    }
+    if (!d_stbc_have_y0) {
+        std::memcpy(d_stbc_y0, y, sizeof(y));
+        d_stbc_y0_sym = sym_idx;
+        d_stbc_have_y0 = true;
+        return;
+    }
+    // second of the pair -> combine. Pilots ride STS0 (h0); use them for a per-pair
+    // common-phase correction on both recovered streams.
+    std::shared_ptr<gr::digital::constellation> mod = d_64qam;
+    if (d_ht_nbpsc == 1) {
+        mod = d_bpsk;
+    } else if (d_ht_nbpsc == 2) {
+        mod = d_qpsk;
+    } else if (d_ht_nbpsc == 4) {
+        mod = d_16qam;
+    }
+    gr_complex s0[64], s1[64];
+    for (int i = 4; i <= 60; i++) {
+        gr_complex h0 = d_stbc_h0[i], h1 = d_stbc_h1[i];
+        float g = std::norm(h0) + std::norm(h1);
+        if (g < 1e-6f) {
+            s0[i] = s1[i] = gr_complex(0, 0);
+            continue;
+        }
+        gr_complex y0 = d_stbc_y0[i], y1 = y[i];
+        s0[i] = (std::conj(h0) * y0 + h1 * std::conj(y1)) / g;
+        gr_complex s1h = (std::conj(h1) * y0 - h0 * std::conj(y1)) / g;
+        s1[i] = -std::conj(s1h);
+    }
+    // common-phase from the STS0 pilots of each recovered symbol
+    gr_complex p0 = equalizer::base::POLARITY[(d_stbc_y0_sym - 2) % 127];
+    gr_complex p1 = equalizer::base::POLARITY[(sym_idx - 2) % 127];
+    gr_complex a0 = (s0[11] + s0[25] + s0[39] - s0[53]) * p0;
+    gr_complex a1 = (s1[11] + s1[25] + s1[39] - s1[53]) * p1;
+    gr_complex d0 = std::polar(1.0f, (float)(-std::arg(a0)));
+    gr_complex d1 = std::polar(1.0f, (float)(-std::arg(a1)));
+
+    for (int pass = 0; pass < 2; pass++) {
+        const gr_complex* s = pass ? s1 : s0;
+        gr_complex derot = pass ? d1 : d0;
+        int b0 = d_ht_dsym * d_ht_ncbps;
+        int c = 0;
+        for (int i = 4; i <= 60; i++) {
+            if (!ht20_is_data(i)) {
+                continue;
+            }
+            gr_complex sym = s[i] * derot;
+            unsigned int val = mod->decision_maker(&sym);
+            for (int k = 0; k < d_ht_nbpsc; k++) {
+                d_ht_rx_bits[b0 + c + k] = (val >> k) & 1;
+            }
+            c += d_ht_nbpsc;
+        }
+        d_ht_dsym++;
+    }
+    d_stbc_have_y0 = false;
+    if (d_ht_dsym >= d_ht_nsym) {
+        ht_finish(); // reuses d_ht_* deinterleave/Viterbi/descramble/CRC; logs [STBC-DATA]
+        d_stbc_active = false;
+    }
 }
 
 } /* namespace ieee802_11 */
