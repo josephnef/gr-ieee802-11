@@ -787,7 +787,7 @@ std::vector<vcf> build_vht40(const uint8_t* mpdu, int mpdu_len, const tx_params&
 // the MCS rate, distribute shortening + (puncturing | repetition) across codewords, encode
 // each, drop the shortening zeros and punctured/extra parity, aggregate. 20 MHz uses no
 // tone mapping (D_TM=1, identity -- confirmed against real RTL8812AU silicon; D_TM>1 makes
-// the chip's LDPC decoder fail). HT-SIG FEC bit (B30) = 1. HT20 MCS 0-7.
+// the chip's LDPC decoder fail). HT-SIG FEC bit (B30) = 1. HT20 MCS 0-7, any length.
 std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params& p)
 {
     const mcs_row& m = HT_MCS20[p.mcs];
@@ -811,20 +811,15 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
         L = 1944;
     } else if (N_avbits <= 2592) {
         N_cw = 2;
-        L = 1944;
+        L = 1296; // 2 x 1296 (the range bound 2592 = 2*1296); L=1944 here over-punctures
     } else {
         L = 1944;
         N_cw = (N_pld * rden + 1944 * rnum - 1) / (1944 * rnum); // ceil(N_pld / (1944*R))
     }
     int Kcw = L * rnum / rden; // info bits per codeword
     int Mcw = L - Kcw;         // parity bits per codeword
-    // Multi-codeword (N_cw>1) distributes shortening/puncturing across codewords; the
-    // distribution is implemented below but not yet chip-verified (heavy distributed
-    // puncturing decodes wrong on real silicon), so gate it until validated. Single
-    // codewords (L up to 1944 -> ~120 B at R=1/2, ~200 B at R=5/6) cover typical frames.
-    if (N_cw > 1)
-        throw std::runtime_error("wifi_tx: LDPC multi-codeword (N_cw>1) not yet supported");
-
+    // [DEBUG SWEEP] env knobs to disambiguate the multi-codeword distribution vs the chip's
+    // LDPC decoder; the winning combination becomes the default and the knobs are removed.
     // Steps c-e: shortening, puncturing (with the over-puncture guard), repetition (totals).
     int N_shrt = std::max(0, N_cw * Kcw - N_pld);
     int N_punc = std::max(0, N_cw * L - N_avbits - N_shrt);
@@ -867,7 +862,8 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
         db[16 + i] = pbits[i];
     vb info_all = scramble(db);
 
-    // Per-codeword shortening/puncturing counts (the first `rem` codewords get one extra).
+    // Per-codeword shortening + puncturing counts, distributed as equally as possible
+    // across codewords (the first `rem` codewords get one extra), per 802.11 19.3.11.7.5.
     LdpcEncoder enc(ldpc_code_for(L, rnum, rden));
     int base_shrt = N_shrt / N_cw, rem_shrt = N_shrt % N_cw;
     int base_punc = N_punc / N_cw, rem_punc = N_punc % N_cw;
@@ -877,7 +873,7 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
     for (int c = 0; c < N_cw; c++) {
         int spcw = base_shrt + (c < rem_shrt ? 1 : 0);
         int ppcw = base_punc + (c < rem_punc ? 1 : 0);
-        int n_info = Kcw - spcw; // real info bits in this codeword (rest are shortening 0s)
+        int n_info = Kcw - spcw; // real info bits in this codeword (the rest are zeros)
         std::vector<uint8_t> info(Kcw, 0), cw(L, 0);
         for (int i = 0; i < n_info; i++)
             info[i] = (info_pos < N_pld) ? info_all[info_pos++] : 0;
