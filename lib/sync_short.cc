@@ -22,7 +22,13 @@
 
 using namespace gr::ieee802_11;
 
-static const int MIN_GAP = 480;
+// The intra-COPY re-trigger gap. Must exceed an HT-mixed frame's L-STF->HT-STF
+// distance (160 L-STF + 160 L-LTF + 80 L-SIG + 160 HT-SIG = 560 samples), else the
+// HT-STF (another short-training plateau) spuriously re-triggers a frame start in the
+// middle of the packet, resetting the CFO correction and mis-windowing the HT-SIG.
+// Legacy frames have no HT-STF so they were unaffected by the old 480. A real
+// back-to-back frame is a full PPDU away (>> 700), so this stays clear of it.
+static const int MIN_GAP = 700;
 static const int MAX_SAMPLES = 540 * 80;
 
 class sync_short_impl : public sync_short
