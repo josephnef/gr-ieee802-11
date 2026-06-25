@@ -78,9 +78,8 @@ HT20 2×2 MIMO** — is over-the-air validated against real Realtek silicon.
 ### TX limitations (current)
 - **STBC / 2×2 MIMO produce two antenna streams**, transmitted over the B210's two
   synchronized TX channels (see `sdr2wifi`'s `rf_tx_air2.py`). The `frame_builder`
-  block currently emits **one** stream (antenna 0); driving both antennas through a
-  USRP sink is done via the standalone `tx_gen` path, and a 2-output block mode is a
-  follow-up. STS1 cyclic-shift diversity (CSD) is also omitted — not needed for the
+  block takes an `n_tx` parameter — set it to 2 to emit both antennas (output 0/1 →
+  USRP sink ch0/ch1). STS1 cyclic-shift diversity (CSD) is omitted — not needed for the
   chip to decode here, but a spec-completeness follow-up.
 - **LDPC TX** is **HT20 MCS 0 only** so far (single R=1/2 n=648 codeword; the
   multi-codeword / 1296 / 1944 / shorten-puncture-repeat selection and 40 MHz LDPC
