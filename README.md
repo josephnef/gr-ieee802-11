@@ -67,9 +67,21 @@ decoded with FCS = 0 at the expected DESC_RATE/bw/ldpc):
   STBC *with the chip itself* and separating its two TX streams from a 2-channel B210
   capture — that's how the HT-LTF P-matrix bug (`[[1,1],[-1,1]]` vs the standard
   `[[1,-1],[1,1]]`) was found.
+- **HT20 2×2 MIMO**, MCS 8–15 (two spatial streams, stream parser + per-stream
+  interleaver + per-stream pilots, standard HT-LTF P-matrix). Antenna 0 is
+  sample-identical to GR-WiFi's stream 0; over the air the RTL8812AU's two RX antennas
+  separate the streams and decode at the expected MCS with FCS = 0.
+
+So the full modern-format TX set — **HT20/HT40/VHT20 BCC, HT20 LDPC, HT20 STBC, and
+HT20 2×2 MIMO** — is over-the-air validated against real Realtek silicon.
 
 ### TX limitations (current)
-- **2×2 MIMO TX** (HT MCS 8–15) is **not implemented** (RX-only).
+- **STBC / 2×2 MIMO produce two antenna streams**, transmitted over the B210's two
+  synchronized TX channels (see `sdr2wifi`'s `rf_tx_air2.py`). The `frame_builder`
+  block currently emits **one** stream (antenna 0); driving both antennas through a
+  USRP sink is done via the standalone `tx_gen` path, and a 2-output block mode is a
+  follow-up. STS1 cyclic-shift diversity (CSD) is also omitted — not needed for the
+  chip to decode here, but a spec-completeness follow-up.
 - **LDPC TX** is **HT20 MCS 0 only** so far (single R=1/2 n=648 codeword; the
   multi-codeword / 1296 / 1944 / shorten-puncture-repeat selection and 40 MHz LDPC
   tone mapping are not yet wired up).
