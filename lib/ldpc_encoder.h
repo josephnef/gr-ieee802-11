@@ -1,37 +1,39 @@
-// Systematic GF(2) encoder for the IEEE 802.11 R=1/2 n=648 QC-LDPC code.
-// Reuses LDPC_BASE_R12_648 from ldpc_min_sum.h; builds the parity-check matrix H,
-// derives the systematic generator (P matrix) by column-pivoted Gaussian elimination,
-// and encodes 324 info bits -> 648 codeword bits. This is a faithful C++ port of
-// sdr2wifi/ldpc.py (build_H / gf2_systematic / encode); validate with a round-trip
-// through ldpc_decode_648 (see ldpc_test.cc).
+// Systematic GF(2) encoder for the IEEE 802.11 QC-LDPC codes (all 12: R=1/2,2/3,3/4,5/6
+// x n=648,1296,1944). Builds the parity-check matrix H from a base matrix + subblock size
+// Z, derives the systematic generator by column-pivoted Gaussian elimination, and encodes
+// k info bits -> n codeword bits. Faithful C++ port of sdr2wifi/ldpc.py
+// (build_H / gf2_systematic / encode); validate with the bit-exact KAT in ldpc_test.cc.
 #ifndef INCLUDED_IEEE802_11_LDPC_ENCODER_H
 #define INCLUDED_IEEE802_11_LDPC_ENCODER_H
 
-#include "ldpc_min_sum.h"
+#include "ldpc_bases.h"
 #include <cstdint>
 #include <vector>
 
 namespace gr {
 namespace ieee802_11 {
 
-struct LdpcEncoder648 {
-    static const int Z = 27;
-    static const int M = 12 * Z; // 324 parity rows
-    static const int N = 24 * Z; // 648 codeword bits
-    std::vector<int> info_cols;  // K columns carrying info bits
-    std::vector<int> par_cols;   // M columns carrying parity bits
-    std::vector<uint8_t> P;      // K x M row-major: parity = info @ P (mod 2)
+struct LdpcEncoder {
+    int Z = 0, rows = 0, M = 0, N = 0;
+    std::vector<int> info_cols; // K columns carrying info bits
+    std::vector<int> par_cols;  // M columns carrying parity bits
+    std::vector<uint8_t> P;     // K x M row-major: parity = info @ P (mod 2)
 
-    LdpcEncoder648() { build(); }
+    LdpcEncoder() {}
+    explicit LdpcEncoder(const ldpc_code& c) { build(c); }
 
-    void build()
+    void build(const ldpc_code& c)
     {
-        // H = build_H(LDPC_BASE_R12_648, Z): each base entry s>=0 -> identity cyclically
-        // shifted right by s (np.roll(I, s, axis=1) -> H[block r][i][(i+s)%Z] = 1).
+        Z = c.Z;
+        rows = c.rows;
+        M = rows * Z; // parity rows
+        N = 24 * Z;   // codeword bits
+        // H = build_H(base, Z): each base entry s>=0 -> identity cyclically shifted right
+        // by s (np.roll(I, s, axis=1) -> H[block r][i][(i+s)%Z] = 1).
         std::vector<std::vector<uint8_t>> H(M, std::vector<uint8_t>(N, 0));
-        for (int br = 0; br < 12; br++) {
+        for (int br = 0; br < rows; br++) {
             for (int bc = 0; bc < 24; bc++) {
-                int s = LDPC_BASE_R12_648[br][bc];
+                int s = c.base[br * 24 + bc];
                 if (s < 0)
                     continue;
                 for (int i = 0; i < Z; i++)
@@ -39,15 +41,14 @@ struct LdpcEncoder648 {
             }
         }
         // gf2_systematic: column-pivoted elimination preferring the rightmost (parity)
-        // columns as pivots, so the chosen pivot columns end up as an identity and the
-        // remaining columns are the info columns.
+        // columns as pivots, so they end up as an identity and the rest are info columns.
         std::vector<char> used(N, 0);
         par_cols.clear();
         for (int r = 0; r < M; r++) {
             int pc = -1;
-            for (int c = N - 1; c >= 0; c--) {
-                if (!used[c] && H[r][c]) {
-                    pc = c;
+            for (int c2 = N - 1; c2 >= 0; c2--) {
+                if (!used[c2] && H[r][c2]) {
+                    pc = c2;
                     break;
                 }
             }
@@ -57,15 +58,15 @@ struct LdpcEncoder648 {
             par_cols.push_back(pc);
             for (int rr = 0; rr < M; rr++) {
                 if (rr != r && H[rr][pc]) {
-                    for (int c = 0; c < N; c++)
-                        H[rr][c] ^= H[r][c];
+                    for (int c2 = 0; c2 < N; c2++)
+                        H[rr][c2] ^= H[r][c2];
                 }
             }
         }
         info_cols.clear();
-        for (int c = 0; c < N; c++)
-            if (!used[c])
-                info_cols.push_back(c);
+        for (int c2 = 0; c2 < N; c2++)
+            if (!used[c2])
+                info_cols.push_back(c2);
 
         std::vector<int> rowof(N, -1);
         for (int r = 0; r < (int)par_cols.size(); r++)
@@ -80,7 +81,8 @@ struct LdpcEncoder648 {
         }
     }
 
-    int k() const { return (int)info_cols.size(); } // 324
+    int k() const { return (int)info_cols.size(); }
+    int n() const { return N; }
 
     // info[k()] -> cw[N]. cw[info_cols]=info; cw[par_cols]=info @ P (mod 2).
     void encode(const uint8_t* info, uint8_t* cw) const
@@ -97,6 +99,12 @@ struct LdpcEncoder648 {
             cw[par_cols[pi]] = (uint8_t)(s & 1);
         }
     }
+};
+
+// Back-compat: the R=1/2 n=648 encoder used by the single-codeword HT20-MCS0 path.
+struct LdpcEncoder648 : LdpcEncoder {
+    static const int N = 648, M = 324;
+    LdpcEncoder648() : LdpcEncoder(ldpc_code_for(648, 1, 2)) {}
 };
 
 } // namespace ieee802_11

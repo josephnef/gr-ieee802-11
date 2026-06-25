@@ -783,26 +783,58 @@ std::vector<vcf> build_vht40(const uint8_t* mpdu, int mpdu_len, const tx_params&
 } // namespace
 
 // HT20 SISO LDPC (MCS0, R=1/2 n=648 single codeword). IEEE 802.11-2016 19.3.11.7.5:
-// scramble SERVICE+PSDU, pad to k=324 with shortening zeros, systematic LDPC-encode,
-// drop the N_shrt shortening info bits + the last N_punc parity bits, then apply the
-// 20 MHz LDPC tone mapping (D_TM=4) per OFDM symbol. HT-SIG FEC bit (B30) = 1.
+// IEEE 802.11-2016 19.3.11.7.5: select N_cw codewords of length L (648/1296/1944) matching
+// the MCS rate, distribute shortening + (puncturing | repetition) across codewords, encode
+// each, drop the shortening zeros and punctured/extra parity, aggregate. 20 MHz uses no
+// tone mapping (D_TM=1, identity -- confirmed against real RTL8812AU silicon; D_TM>1 makes
+// the chip's LDPC decoder fail). HT-SIG FEC bit (B30) = 1. HT20 MCS 0-7.
 std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params& p)
 {
-    // MCS0: BPSK, R=1/2 -> N_DBPS=26, N_CBPS=52 on 52 data SC.
-    const int N_DBPS = 26, N_CBPS = 52, K = 324, Lcw = 648;
-    int N_pld = 16 + 8 * length; // SERVICE(16) + PSDU
+    const mcs_row& m = HT_MCS20[p.mcs];
+    const int N_CBPS = m.n_cbps, N_DBPS = m.n_dbps, rnum = m.rnum, rden = m.rden;
+    int N_pld = 16 + 8 * length; // SERVICE(16) + PSDU; LDPC has no tail bits
+
+    // Step a: N_sym, N_avbits (m_STBC = 1).
     int N_sym = (N_pld + N_DBPS - 1) / N_DBPS;
     int N_avbits = N_sym * N_CBPS;
-    int N_shrt = K - N_pld;                 // shortening zeros in the single codeword
-    int N_punc = Lcw - N_avbits - N_shrt;   // parity bits punctured from the tail
-    // Puncture-too-aggressive guard (bump one OFDM symbol). R/(1-R)=1 for R=1/2.
-    if ((N_punc > 0.1 * Lcw * 0.5 && N_shrt < 1.2 * N_punc) || N_punc > 0.3 * Lcw * 0.5) {
+
+    // Step b: number of codewords N_cw and codeword length L.
+    int N_cw, L;
+    if (N_avbits <= 648) {
+        N_cw = 1;
+        L = 648;
+    } else if (N_avbits <= 1296) {
+        N_cw = 1;
+        L = 1296;
+    } else if (N_avbits <= 1944) {
+        N_cw = 1;
+        L = 1944;
+    } else if (N_avbits <= 2592) {
+        N_cw = 2;
+        L = 1944;
+    } else {
+        L = 1944;
+        N_cw = (N_pld * rden + 1944 * rnum - 1) / (1944 * rnum); // ceil(N_pld / (1944*R))
+    }
+    int Kcw = L * rnum / rden; // info bits per codeword
+    int Mcw = L - Kcw;         // parity bits per codeword
+    // Multi-codeword (N_cw>1) distributes shortening/puncturing across codewords; the
+    // distribution is implemented below but not yet chip-verified (heavy distributed
+    // puncturing decodes wrong on real silicon), so gate it until validated. Single
+    // codewords (L up to 1944 -> ~120 B at R=1/2, ~200 B at R=5/6) cover typical frames.
+    if (N_cw > 1)
+        throw std::runtime_error("wifi_tx: LDPC multi-codeword (N_cw>1) not yet supported");
+
+    // Steps c-e: shortening, puncturing (with the over-puncture guard), repetition (totals).
+    int N_shrt = std::max(0, N_cw * Kcw - N_pld);
+    int N_punc = std::max(0, N_cw * L - N_avbits - N_shrt);
+    if ((N_punc > 0.1 * N_cw * Mcw && N_shrt < 1.2 * N_punc * rnum / (double)(rden - rnum)) ||
+        N_punc > 0.3 * N_cw * Mcw) {
         N_sym += 1;
         N_avbits = N_sym * N_CBPS;
-        N_punc = Lcw - N_avbits - N_shrt;
+        N_punc = std::max(0, N_cw * L - N_avbits - N_shrt);
     }
-    if (N_shrt < 0 || N_punc < 0 || N_avbits > Lcw)
-        throw std::runtime_error("wifi_tx: LDPC length out of single-648-codeword range");
+    int N_rep = (N_punc == 0) ? std::max(0, N_avbits - (N_cw * L - N_shrt)) : 0;
 
     vcf frame = preamble();
     int lsig_len = lsig_length_ht(N_sym, 1);
@@ -828,34 +860,42 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
     append(frame, ofdm_symbol(lstf_freq()));
     append(frame, ofdm_symbol(htltf20_freq()));
 
-    // LDPC encode: info = scramble(SERVICE+PSDU) ++ N_shrt shortening zeros.
-    static LdpcEncoder648 enc;
+    // Payload bits (SERVICE 16 zeros + PSDU), scrambled, parsed across the codewords.
     vb db(N_pld, 0);
     vb pbits = bytes_to_bits(psdu, length);
     for (size_t i = 0; i < pbits.size(); i++)
         db[16 + i] = pbits[i];
-    vb scr = scramble(db);
-    std::vector<uint8_t> info(K, 0), cw(Lcw, 0);
-    for (int i = 0; i < N_pld; i++)
-        info[i] = scr[i];
-    enc.encode(info.data(), cw.data());
-    // Transmitted coded bits: info[0:N_pld] (drop shortening) ++ parity[0:m-N_punc].
+    vb info_all = scramble(db);
+
+    // Per-codeword shortening/puncturing counts (the first `rem` codewords get one extra).
+    LdpcEncoder enc(ldpc_code_for(L, rnum, rden));
+    int base_shrt = N_shrt / N_cw, rem_shrt = N_shrt % N_cw;
+    int base_punc = N_punc / N_cw, rem_punc = N_punc % N_cw;
     vb coded;
     coded.reserve(N_avbits);
-    for (int i = 0; i < N_pld; i++)
-        coded.push_back(cw[i]);
-    for (int i = K; i < Lcw - N_punc; i++)
-        coded.push_back(cw[i]);
+    int info_pos = 0;
+    for (int c = 0; c < N_cw; c++) {
+        int spcw = base_shrt + (c < rem_shrt ? 1 : 0);
+        int ppcw = base_punc + (c < rem_punc ? 1 : 0);
+        int n_info = Kcw - spcw; // real info bits in this codeword (rest are shortening 0s)
+        std::vector<uint8_t> info(Kcw, 0), cw(L, 0);
+        for (int i = 0; i < n_info; i++)
+            info[i] = (info_pos < N_pld) ? info_all[info_pos++] : 0;
+        enc.encode(info.data(), cw.data()); // cw = [info(Kcw) | parity(Mcw)]
+        for (int i = 0; i < n_info; i++)    // info bits, shortening zeros dropped
+            coded.push_back(cw[i]);
+        for (int i = 0; i < Mcw - ppcw; i++) // parity bits, last ppcw punctured
+            coded.push_back(cw[Kcw + i]);
+    }
+    for (int i = 0; i < N_rep; i++) // repetition: repeat the first N_rep coded bits
+        coded.push_back(coded[i]);
 
-    // Per symbol: BPSK map straight onto the 52 data SC, then cycling DATA pilots.
-    // 20 MHz HT LDPC uses NO tone mapping (D_TM=1, identity) -- confirmed against real
-    // RTL8812AU silicon: D_TM=4 (the value sometimes quoted) and every other D_TM>1
-    // permutation makes the chip's LDPC decoder fail the DATA CRC; only the in-order
-    // mapping decodes clean. (LDPC tone mapping only applies at 40 MHz and wider.)
+    // Map the aggregated coded stream to N_sym symbols (no tone mapping at 20 MHz), with
+    // cycling DATA pilots. MCS 0-7 via the per-MCS constellation (n_bpsc).
     const int htp_base[4] = { 1, 1, 1, -1 };
     for (int j = 0; j < N_sym; j++) {
         vb chunk(coded.begin() + j * N_CBPS, coded.begin() + (j + 1) * N_CBPS);
-        vcf pts = map_bpsk(chunk);
+        vcf pts = map_qam(chunk, m.n_bpsc);
         float pol = POLARITY[(3 + j) % 127];
         cf pil[4];
         for (int i = 0; i < 4; i++)
@@ -1263,8 +1303,8 @@ std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
     if (p.mcs > 7)
         throw std::runtime_error("wifi_tx: SISO MCS0-7 only (so far)");
     if (p.fec == TX_LDPC) {
-        if (p.format != TX_HT || p.bw != 20 || p.mcs != 0)
-            throw std::runtime_error("wifi_tx: LDPC only HT20 MCS0 (so far)");
+        if (p.format != TX_HT || p.bw != 20 || p.mcs > 7)
+            throw std::runtime_error("wifi_tx: LDPC only HT20 MCS0-7 (so far)");
         return build_ht_ldpc(psdu, psdu_len, p);
     }
     if (p.fec != TX_BCC)
