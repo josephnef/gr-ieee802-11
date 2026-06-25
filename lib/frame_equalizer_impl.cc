@@ -918,15 +918,27 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
         eqd[i] = r / hi;
     }
 
-    // common phase from the pilots (HT20: 4 at {11,25,39,53} sign {+,+,+,-};
-    // HT40: 6 at {11,39,53,75,89,117} sign {+,+,+,-,-,+}) times the polarity Pn.
-    gr_complex p = equalizer::base::POLARITY[(sym_idx - 2) % 127];
-    gr_complex acc;
+    // Common phase from the DATA pilots, 802.11-2016 cycling convention: the base pilot
+    // pattern is cyclically rotated by the data-symbol index and multiplied by the
+    // polarity sequence at POLARITY[sym_idx-4] (HT data starts at OFDM sym 7, VHT at 8).
+    // HT20/VHT base {1,1,1,-1} at {11,25,39,53}; HT40 {1,1,1,-1,-1,1} at
+    // {11,39,53,75,89,117}. This matches real Realtek silicon and the fork's TX; the old
+    // fixed {+,+,+,-} pattern only matched a decoder-targeted generator.
+    int jdata = d_vht ? (sym_idx - 8) : (sym_idx - 7);
+    gr_complex p = equalizer::base::POLARITY[((sym_idx - 4) % 127 + 127) % 127];
+    gr_complex acc(0, 0);
     if (ht40) {
-        acc = (eqd[11] + eqd[39] + eqd[53] - eqd[75] - eqd[89] + eqd[117]) * p;
+        static const int sc[6] = { 11, 39, 53, 75, 89, 117 };
+        static const int base[6] = { 1, 1, 1, -1, -1, 1 };
+        for (int i = 0; i < 6; i++)
+            acc += eqd[sc[i]] * (float)base[((i + jdata) % 6 + 6) % 6];
     } else {
-        acc = (eqd[11] + eqd[25] + eqd[39] - eqd[53]) * p;
+        static const int sc[4] = { 11, 25, 39, 53 };
+        static const int base[4] = { 1, 1, 1, -1 };
+        for (int i = 0; i < 4; i++)
+            acc += eqd[sc[i]] * (float)base[((i + jdata) % 4 + 4) % 4];
     }
+    acc *= p;
     gr_complex derot = std::polar(1.0f, (float)(-std::arg(acc)));
 
     std::shared_ptr<gr::digital::constellation> mod = d_64qam;
@@ -1263,8 +1275,11 @@ void frame_equalizer_impl::stbc_estimate_ltf()
                        exp(gr_complex(0, 2 * M_PI * 7 * slen *
                                              (d_epsilon0 + d_er_frozen) * (i - dc) / 64)) /
                        ref;
-        d_stbc_h0[i] = (a + b) * gr_complex(0.5f, 0);
-        d_stbc_h1[i] = (b - a) * gr_complex(0.5f, 0);
+        // Standard 802.11 HT-LTF P-matrix [[1,-1],[1,1]] (STS0=[+,-], STS1=[+,+]) as used
+        // by real Realtek silicon and the fork's TX: a=h0+h1, b=-h0+h1 -> recover via
+        // h0=(a-b)/2, h1=(a+b)/2. (The old [[1,1],[-1,1]] gave (a+b)/2, (b-a)/2.)
+        d_stbc_h0[i] = (a - b) * gr_complex(0.5f, 0);
+        d_stbc_h1[i] = (a + b) * gr_complex(0.5f, 0);
     }
 }
 
@@ -1309,11 +1324,21 @@ void frame_equalizer_impl::stbc_data_symbol(const gr_complex* raw, int sym_idx)
         gr_complex s1h = (std::conj(h1) * y0 - h0 * std::conj(y1)) / g;
         s1[i] = -std::conj(s1h);
     }
-    // common-phase from the STS0 pilots of each recovered symbol
-    gr_complex p0 = equalizer::base::POLARITY[(d_stbc_y0_sym - 2) % 127];
-    gr_complex p1 = equalizer::base::POLARITY[(sym_idx - 2) % 127];
-    gr_complex a0 = (s0[11] + s0[25] + s0[39] - s0[53]) * p0;
-    gr_complex a1 = (s1[11] + s1[25] + s1[39] - s1[53]) * p1;
+    // common-phase from the STS0 pilots, spec cycling convention (base {1,1,1,-1} rotated
+    // by the data-symbol index * POLARITY[sym-5]; STBC data starts at OFDM sym 8, so the
+    // SISO data index = sym-8 and the polarity start is 3 -> POLARITY[3+(sym-8)]).
+    static const int psc[4] = { 11, 25, 39, 53 };
+    static const int pbase[4] = { 1, 1, 1, -1 };
+    auto pilot_acc = [&](const gr_complex* s, int sym) {
+        int j = sym - 8;
+        gr_complex pol = equalizer::base::POLARITY[((sym - 5) % 127 + 127) % 127];
+        gr_complex a(0, 0);
+        for (int k = 0; k < 4; k++)
+            a += s[psc[k]] * (float)pbase[((k + j) % 4 + 4) % 4];
+        return a * pol;
+    };
+    gr_complex a0 = pilot_acc(s0, d_stbc_y0_sym);
+    gr_complex a1 = pilot_acc(s1, sym_idx);
     gr_complex d0 = std::polar(1.0f, (float)(-std::arg(a0)));
     gr_complex d1 = std::polar(1.0f, (float)(-std::arg(a1)));
 
