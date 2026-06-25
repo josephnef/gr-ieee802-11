@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [feat/ht-vht-rx]
+    branches: [main, feat/ht-vht-rx]
   pull_request:
   workflow_dispatch:
 
