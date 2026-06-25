@@ -52,7 +52,8 @@ int main(int argc, char** argv)
     p.format = (fmt == "vht") ? tx::TX_VHT : tx::TX_HT;
     p.fec = (fmt == "ldpc") ? tx::TX_LDPC : tx::TX_BCC;
     p.stbc = (fmt == "stbc") ? 1 : 0;
-    p.mcs = mcs;
+    // "mimo" = 2x2 HT MIMO; the per-stream MCS arg maps to HT MCS 8+mcs.
+    p.mcs = (fmt == "mimo") ? 8 + mcs : mcs;
     p.bw = bw;
 
     auto psdu = make_psdu(24);
@@ -62,10 +63,10 @@ int main(int argc, char** argv)
     // single-RX-antenna view (their sum, h0=h1=1). Non-STBC -> antenna 0 only.
     const bool two_ant = std::getenv("STBC_2ANT") != nullptr;
     std::vector<std::vector<tx::cf>> ants;
-    if (p.stbc && built.size() == 2 && two_ant) {
-        ants = built; // ant0, ant1 separate
+    if (built.size() == 2 && two_ant) {
+        ants = built; // ant0, ant1 separate (STBC/MIMO 2-channel harness)
     } else if (p.stbc && built.size() == 2) {
-        std::vector<tx::cf> s(built[0].size());
+        std::vector<tx::cf> s(built[0].size()); // STBC self-loop: single-RX-antenna sum
         for (size_t i = 0; i < s.size(); i++)
             s[i] = built[0][i] + built[1][i];
         ants.push_back(s);

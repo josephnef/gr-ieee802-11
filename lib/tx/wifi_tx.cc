@@ -821,9 +821,133 @@ std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
     return { a0, a1 };
 }
 
+// ---- 2x2 HT MIMO (MCS 8-15, HT20) ----
+// per-stream {n_bpsc, rnum, rden, n_cbps_ss, n_dbps_ss} = HT20 SISO MCS 0-7 params.
+const mcs_row HT_MCS_MIMO[8] = { { 1, 1, 2, 52, 26 },   { 2, 1, 2, 104, 52 },
+                                 { 2, 3, 4, 104, 78 },  { 4, 1, 2, 208, 104 },
+                                 { 4, 3, 4, 208, 156 }, { 6, 2, 3, 312, 208 },
+                                 { 6, 3, 4, 312, 234 }, { 6, 5, 6, 312, 260 } };
+// HT20 DATA pilot pattern per spatial stream, N_SS=2 (802.11 Table 19-21).
+const int MIMO_PILOT2[2][4] = { { 1, 1, -1, -1 }, { 1, -1, -1, 1 } };
+const int N_ROT_20 = 11;
+
+// 802.11n stream parser (19.3.11.6): one BCC stream -> n_ss streams, s bits round-robin.
+std::vector<vb> stream_parse(const vb& coded, int n_ss, int n_bpsc, int n_cbps_ss)
+{
+    int s = std::max(n_bpsc / 2, 1);
+    int nsym = (int)coded.size() / (n_ss * n_cbps_ss);
+    std::vector<vb> out(n_ss, vb(nsym * n_cbps_ss, 0));
+    std::vector<int> pos(n_ss, 0);
+    int idx = 0, blocks_per_sym = (n_ss * n_cbps_ss) / s;
+    for (int sym = 0; sym < nsym; sym++)
+        for (int blk = 0; blk < blocks_per_sym; blk++) {
+            int ss = blk % n_ss;
+            for (int b = 0; b < s; b++)
+                out[ss][pos[ss]++] = coded[idx++];
+        }
+    return out;
+}
+
+// HT interleave for spatial stream iss (0-based), with the 3rd-permutation frequency
+// rotation (19.3.11.7.3) for iss>0.
+vb interleave_ht_ss(const vb& bits, int n_cbps_ss, int n_bpsc, int iss)
+{
+    int s = std::max(n_bpsc / 2, 1), n_col = 13, n_row = 4 * n_bpsc;
+    int issp = iss + 1;
+    int jrot = (((issp - 1) * 2) % 3 + 3 * ((issp - 1) / 3)) * N_ROT_20 * n_bpsc;
+    vb out(bits.size(), 0);
+    int nsym = (int)bits.size() / n_cbps_ss;
+    for (int sym = 0; sym < nsym; sym++) {
+        int base = sym * n_cbps_ss;
+        for (int k = 0; k < n_cbps_ss; k++) {
+            int i = n_row * (k % n_col) + (k / n_col);
+            int j = s * (i / s) + (i + n_cbps_ss - (n_col * i) / n_cbps_ss) % s;
+            int r = ((j - jrot) % n_cbps_ss + n_cbps_ss) % n_cbps_ss;
+            out[base + r] = bits[base + k];
+        }
+    }
+    return out;
+}
+
+// HT20 MIMO DATA symbol (64-bin freq) for spatial stream ss, data-symbol index j:
+// 52 data SC + per-stream cycling pilots (MIMO_PILOT2[ss] rotated by j, * POLARITY[3+j]).
+vcf mimo_data_freq(const vcf& pts, int ss, int j)
+{
+    vcf freq(64, cf(0, 0));
+    for (int c = 0; c < 52; c++)
+        freq[DATA_SC_HT[c]] = pts[c];
+    float pol = POLARITY[(3 + j) % 127];
+    for (int i = 0; i < 4; i++)
+        freq[PILOT_SC[i]] = cf(MIMO_PILOT2[ss][(i + j) % 4] * pol, 0);
+    return freq;
+}
+
+// 2x2 HT MIMO (MCS 8-15). Returns {ant0=STS0, ant1=STS1}. STS0 has zero cyclic shift
+// (matches a spec stream-0 capture); STS1 CSD for the over-air case is a follow-up.
+std::vector<vcf> build_mimo(const uint8_t* psdu, int length, const tx_params& p)
+{
+    int mcs8 = p.mcs - 8; // 0..7 per-stream index
+    const mcs_row& m = HT_MCS_MIMO[mcs8];
+    const int n_ss = 2;
+    int n_dbps_tot = n_ss * m.n_dbps;
+    int nsym = (16 + 8 * length + 6 + n_dbps_tot - 1) / n_dbps_tot;
+    int n_ltf = 2;
+
+    vcf a0 = preamble(), a1 = preamble();
+    auto both = [&](const vcf& s) { append(a0, s); append(a1, s); };
+    int lsig_len = lsig_length_ht(nsym, n_ltf);
+    both(data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2, false, false));
+    // HT-SIG: MCS 8-15 (2 SS), reserved bits 24/25/26=1, no STBC/LDPC.
+    vb hsig(48, 0);
+    for (int i = 0; i < 7; i++)
+        hsig[i] = (p.mcs >> i) & 1;
+    for (int i = 0; i < 16; i++)
+        hsig[8 + i] = (length >> i) & 1;
+    hsig[24] = hsig[25] = hsig[26] = 1;
+    uint8_t crc = ht_sig_crc8(vb(hsig.begin(), hsig.begin() + 34));
+    for (int i = 0; i < 8; i++)
+        hsig[34 + i] = (crc >> (7 - i)) & 1;
+    vb hi = interleave_legacy(conv_encode(hsig), 48, 1);
+    both(data_symbol(map_bpsk(vb(hi.begin(), hi.begin() + 48)), DATA_SC_LEGACY, 48, 3, true, false));
+    both(data_symbol(map_bpsk(vb(hi.begin() + 48, hi.end())), DATA_SC_LEGACY, 48, 4, true, false));
+    both(ofdm_symbol(lstf_freq())); // HT-STF
+
+    // HT-LTF: 2 symbols, standard P-matrix [[1,-1],[1,1]] (STS0=[+,-], STS1=[+,+]).
+    vcf ltf_p = htltf20_freq(), ltf_n(64);
+    for (int i = 0; i < 64; i++)
+        ltf_n[i] = -ltf_p[i];
+    append(a0, ofdm_symbol(ltf_p));
+    append(a0, ofdm_symbol(ltf_n)); // STS0 LTF [+,-]
+    append(a1, ofdm_symbol(ltf_p));
+    append(a1, ofdm_symbol(ltf_p)); // STS1 LTF [+,+]
+
+    // DATA: scramble -> BCC -> puncture -> stream-parse(2) -> per-stream interleave -> QAM.
+    vb data_bits(nsym * n_dbps_tot, 0);
+    vb pbits = bytes_to_bits(psdu, length);
+    for (size_t i = 0; i < pbits.size(); i++)
+        data_bits[16 + i] = pbits[i];
+    vb scr = scramble(data_bits);
+    for (int i = 0; i < 6; i++)
+        scr[16 + 8 * length + i] = 0;
+    vb coded = puncture(conv_encode(scr), m.rnum, m.rden);
+    std::vector<vb> parts = stream_parse(coded, n_ss, m.n_bpsc, m.n_cbps);
+    vcf* outs[2] = { &a0, &a1 };
+    for (int ss = 0; ss < n_ss; ss++) {
+        vb il = interleave_ht_ss(parts[ss], m.n_cbps, m.n_bpsc, ss);
+        for (int j = 0; j < nsym; j++) {
+            vb chunk(il.begin() + j * m.n_cbps, il.begin() + (j + 1) * m.n_cbps);
+            append(*outs[ss], ofdm_symbol(mimo_data_freq(map_qam(chunk, m.n_bpsc), ss, j)));
+        }
+    }
+    return { a0, a1 };
+}
+
 std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
                                          const tx_params& p)
 {
+    if (p.stbc == 0 && p.fec == TX_BCC && p.format == TX_HT && p.bw == 20 &&
+        p.mcs >= 8 && p.mcs <= 15)
+        return build_mimo(psdu, psdu_len, p);
     if (p.stbc != 0) {
         if (p.format != TX_HT || p.bw != 20 || p.fec != TX_BCC || p.mcs > 7)
             throw std::runtime_error("wifi_tx: STBC only HT20 BCC MCS0-7 (so far)");
