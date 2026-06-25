@@ -81,11 +81,11 @@ HT20 2×2 MIMO** — is over-the-air validated against real Realtek silicon.
   block takes an `n_tx` parameter — set it to 2 to emit both antennas (output 0/1 →
   USRP sink ch0/ch1). Antenna 1 (STS1) is cyclic-shifted (CSD) per 802.11 — legacy
   fields −200 ns, HT fields −400 ns — matching GR-WiFi's `procCSD`.
-- **LDPC TX** covers HT20 MCS 0–7, single codeword (n = 648 / 1296 / 1944, the largest the
-  payload needs) with spec shortening + puncturing. The encoder supports all 12 IEEE 802.11
-  QC-LDPC codes (bit-exact to `sdr2wifi/ldpc.py`, see `scripts/ldpc_kat.sh`). Multi-codeword
-  (N_cw > 1, payloads beyond one 1944 codeword) and 40 MHz LDPC tone mapping are not yet
-  wired up.
+- **LDPC TX** covers HT20 MCS 0–7, any length — the full 802.11 codeword selection
+  (n = 648 / 1296 / 1944), multi-codeword, and distributed shortening + puncturing +
+  repetition. The encoder supports all 12 IEEE 802.11 QC-LDPC codes (bit-exact to
+  `sdr2wifi/ldpc.py`, see `scripts/ldpc_kat.sh`); 1/2/3-codeword frames are chip-validated.
+  Only 40 MHz LDPC tone mapping remains.
 - **VHT TX** covers 20/40 MHz, NSS = 1–2, MCS 0–9 (256-QAM included). 80/160 MHz are not
   yet wired up. (256-QAM and 40 MHz at high MCS need a high link SNR to decode over the air
   — VHT20 MCS8, VHT40 MCS0 and VHT20 NSS=2 MCS0 are chip-validated; the modulation is
