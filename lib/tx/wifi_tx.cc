@@ -54,6 +54,14 @@ const mcs_row HT_MCS20[8] = {
     { 1, 1, 2, 52, 26 }, { 2, 1, 2, 104, 52 }, { 2, 3, 4, 104, 78 }, { 4, 1, 2, 208, 104 },
     { 4, 3, 4, 208, 156 }, { 6, 2, 3, 312, 208 }, { 6, 3, 4, 312, 234 }, { 6, 5, 6, 312, 260 }
 };
+// VHT per-stream MCS (20 MHz, 52 data SC). MCS0-7 == HT20; MCS8 adds 256-QAM (r3/4).
+// VHT20 NSS=1 MCS9 (256-QAM r5/6) has a non-integer n_dbps (416*5/6) and is excluded by
+// the spec -> it is only valid at >=40 MHz (see build_vht40).
+const mcs_row VHT_MCS20[9] = {
+    { 1, 1, 2, 52, 26 },   { 2, 1, 2, 104, 52 },  { 2, 3, 4, 104, 78 },
+    { 4, 1, 2, 208, 104 }, { 4, 3, 4, 208, 156 }, { 6, 2, 3, 312, 208 },
+    { 6, 3, 4, 312, 234 }, { 6, 5, 6, 312, 260 }, { 8, 3, 4, 416, 312 }
+};
 
 // ---- small DSP helpers ----
 typedef std::vector<cf> vcf;
@@ -252,6 +260,16 @@ cf qam_point(int v, int n_bpsc)
         int i = lvl[((v >> 3) & 1) | ((v >> 4 & 1) << 1) | ((v >> 5 & 1) << 2)];
         return cf(r * l, i * l);
     }
+    if (n_bpsc == 8) {
+        // 256-QAM (VHT MCS 8-9): 16-level Gray-coded PAM per axis, scale 1/sqrt(170).
+        // Levels are the 4-bit I/Q tables from IEEE 802.11 (== GR-WiFi C_QAM_MODU_TAB[5]).
+        float l = (float)std::sqrt(1.0 / 170.0);
+        const int lvl[16] = { -15, 15, -1, 1,  -9, 9,  -7, 7,
+                              -13, 13, -3, 3, -11, 11, -5, 5 };
+        int r = lvl[v & 0xF];
+        int i = lvl[(v >> 4) & 0xF];
+        return cf(r * l, i * l);
+    }
     throw std::runtime_error("unsupported n_bpsc");
 }
 
@@ -423,7 +441,7 @@ vb ampdu_wrap(const uint8_t* mpdu, int len)
 // aggregated); VHT-SIG-B carries the APEP length and its CRC-8 seeds DATA SERVICE[8:16].
 std::vector<vcf> build_vht20(const uint8_t* mpdu, int mpdu_len, const tx_params& p)
 {
-    const mcs_row& m = HT_MCS20[p.mcs]; // VHT MCS0-7 per-stream params == HT 20 MHz
+    const mcs_row& m = VHT_MCS20[p.mcs]; // VHT MCS0-7 == HT20; MCS8 = 256-QAM r3/4
     vb ampdu = ampdu_wrap(mpdu, mpdu_len);
     int alen = (int)ampdu.size();
     int nsym = (16 + 8 * alen + 6 + m.n_dbps - 1) / m.n_dbps;
@@ -657,6 +675,107 @@ std::vector<vcf> build_ht40(const uint8_t* psdu, int length, const tx_params& p)
         for (int i = 0; i < 6; i++)
             pil[i] = cf(PILOT40_BASE[(i + j) % 6] * pol, 0);
         append(frame, data_symbol40(map_qam(chunk, m.n_bpsc), DSC, 7 + j, false, pil));
+    }
+    return { frame };
+}
+
+// A SIG symbol in HT40 non-HT-duplicate form with EXPLICIT legacy pilots (the VHT-SIG-A
+// duplicate uses the fixed sigpil rather than the polarity sequence).
+vcf sig_dup40_pil(const vb& bits48, bool rotate, const cf* pil4)
+{
+    vcf f64(64, cf(0, 0));
+    vcf pts = map_bpsk(bits48);
+    if (rotate)
+        for (auto& q : pts)
+            q *= cf(0, 1);
+    for (int c = 0; c < 48; c++)
+        f64[DATA_SC_LEGACY[c]] = pts[c];
+    for (int i = 0; i < 4; i++)
+        f64[PILOT_SC[i]] = pil4[i];
+    return ofdm_symbol(dup40(f64));
+}
+
+// VHT40 SU SISO (MCS 0-9, BCC). Reuses the HT40 geometry (128-FFT, 108 data SC, 6 pilots)
+// with the VHT preamble + SIG fields. VHT-LTF40 == HT-LTF40 (C_LTF_VHT_58 = C_LTF_HT_58).
+std::vector<vcf> build_vht40(const uint8_t* mpdu, int mpdu_len, const tx_params& p)
+{
+    // VHT40 per-stream MCS (108 data SC): MCS0-7 == HT40; MCS8 256-QAM r3/4, MCS9 r5/6.
+    static const mcs_row VHT_MCS40[10] = {
+        { 1, 1, 2, 108, 54 },  { 2, 1, 2, 216, 108 }, { 2, 3, 4, 216, 162 },
+        { 4, 1, 2, 432, 216 }, { 4, 3, 4, 432, 324 }, { 6, 2, 3, 648, 432 },
+        { 6, 3, 4, 648, 486 }, { 6, 5, 6, 648, 540 }, { 8, 3, 4, 864, 648 },
+        { 8, 5, 6, 864, 720 }
+    };
+    const mcs_row& m = VHT_MCS40[p.mcs];
+    vb ampdu = ampdu_wrap(mpdu, mpdu_len);
+    int alen = (int)ampdu.size();
+    int nsym = (16 + 8 * alen + 6 + m.n_dbps - 1) / m.n_dbps;
+    int n_ltf = 1;
+    std::vector<int> DSC = data_sc_ht40();
+    const cf sigpil[4] = { cf(1, 0), cf(1, 0), cf(1, 0), cf(-1, 0) };
+    cf pil40_base[6];
+    for (int i = 0; i < 6; i++)
+        pil40_base[i] = cf((float)PILOT40_BASE[i], 0);
+
+    vcf frame = preamble40();
+
+    // L-SIG (dup40), spec VHT length.
+    int txtime = 20 + 8 + 4 + 4 * n_ltf + 4 + 4 * nsym;
+    int lsig_len = 3 * ((txtime - 20 + 3) / 4) - 3;
+    append(frame, sig_symbol_dup40(sig_field(11, lsig_len), 2, false));
+
+    // VHT-SIG-A (dup40): B0-1 BW=01 (40 MHz), reserved B2/B23/B33=1, MCS B28-31.
+    vb a(48, 0);
+    a[0] = 1; // BW = 40 MHz (B0=1, B1=0)
+    a[2] = 1;
+    a[23] = 1;
+    a[33] = 1;
+    for (int i = 0; i < 4; i++)
+        a[28 + i] = (p.mcs >> i) & 1;
+    uint8_t acrc = ht_sig_crc8(vb(a.begin(), a.begin() + 34));
+    for (int i = 0; i < 8; i++)
+        a[34 + i] = (acrc >> (7 - i)) & 1;
+    vb a_il = interleave_legacy(conv_encode(a), 48, 1);
+    append(frame, sig_dup40_pil(vb(a_il.begin(), a_il.begin() + 48), false, sigpil));
+    append(frame, sig_dup40_pil(vb(a_il.begin() + 48, a_il.end()), true, sigpil));
+
+    // VHT-STF (= dup40 L-STF) + VHT-LTF40 (== HT-LTF40).
+    append(frame, ofdm_symbol(dup40(lstf_freq())));
+    append(frame, ofdm_symbol(htltf40_freq()));
+
+    // VHT-SIG-B (40 MHz): 19 len + 2 reserved=1 + 6 tail = 27 bits, repeated x2 -> 54,
+    // BCC -> 108 coded, BPSK over the 108 data SC. CRC-8 over the 21 len+reserved bits
+    // seeds DATA SERVICE[8:16].
+    int apep = alen / 4;
+    vb b(27, 0);
+    for (int i = 0; i < 19; i++)
+        b[i] = (apep >> i) & 1;
+    b[19] = b[20] = 1; // reserved
+    uint8_t bcrc = ht_sig_crc8(vb(b.begin(), b.begin() + 21));
+    vb b2(b);
+    b2.insert(b2.end(), b.begin(), b.end()); // x2 -> 54
+    vb b_il = interleave_ht(conv_encode(b2), 108, 1, 40); // 54 -> 108
+    append(frame, data_symbol40(map_bpsk(b_il), DSC, 7, false, pil40_base));
+
+    // VHT DATA: SERVICE(16) = [0]*8 + SIG-B CRC(8) + A-MPDU + pad; scrambled.
+    vb data_bits(nsym * m.n_dbps, 0);
+    for (int i = 0; i < 8; i++)
+        data_bits[8 + i] = (bcrc >> (7 - i)) & 1; // SERVICE[8:16]
+    vb abits = bytes_to_bits(ampdu.data(), alen);
+    for (size_t i = 0; i < abits.size(); i++)
+        data_bits[16 + i] = abits[i];
+    vb scr = scramble(data_bits);
+    for (int i = 0; i < 6; i++)
+        scr[16 + 8 * alen + i] = 0; // tail
+    vb coded = puncture(conv_encode(scr), m.rnum, m.rden);
+    vb il = interleave_ht(coded, m.n_cbps, m.n_bpsc, 40);
+    for (int j = 0; j < nsym; j++) {
+        vb chunk(il.begin() + j * m.n_cbps, il.begin() + (j + 1) * m.n_cbps);
+        float pol = POLARITY[(4 + j) % 127]; // VHT data starts at sym 8 (VHT-SIG-B at 7)
+        cf pil[6];
+        for (int i = 0; i < 6; i++)
+            pil[i] = cf(PILOT40_BASE[(i + j) % 6] * pol, 0);
+        append(frame, data_symbol40(map_qam(chunk, m.n_bpsc), DSC, 8 + j, false, pil));
     }
     return { frame };
 }
@@ -1002,6 +1121,22 @@ std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
             throw std::runtime_error("wifi_tx: STBC only HT20 BCC MCS0-7 (so far)");
         return build_stbc(psdu, psdu_len, p);
     }
+    if (p.format == TX_VHT) {
+        if (p.fec != TX_BCC)
+            throw std::runtime_error("wifi_tx: VHT LDPC not supported (so far)");
+        if (p.bw == 20) {
+            // VHT20 NSS=1: MCS 0-8 (MCS9 256-QAM r5/6 has non-integer n_dbps at 20 MHz).
+            if (p.mcs > 8)
+                throw std::runtime_error("wifi_tx: VHT20 MCS0-8 (so far)");
+            return build_vht20(psdu, psdu_len, p);
+        }
+        if (p.bw == 40) {
+            if (p.mcs > 9)
+                throw std::runtime_error("wifi_tx: VHT40 MCS0-9");
+            return build_vht40(psdu, psdu_len, p);
+        }
+        throw std::runtime_error("wifi_tx: VHT only 20/40 MHz (so far)");
+    }
     if (p.mcs > 7)
         throw std::runtime_error("wifi_tx: SISO MCS0-7 only (so far)");
     if (p.fec == TX_LDPC) {
@@ -1011,11 +1146,6 @@ std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
     }
     if (p.fec != TX_BCC)
         throw std::runtime_error("wifi_tx: unknown FEC");
-    if (p.format == TX_VHT) {
-        if (p.bw != 20)
-            throw std::runtime_error("wifi_tx: VHT only 20 MHz (so far)");
-        return build_vht20(psdu, psdu_len, p);
-    }
     if (p.format != TX_HT)
         throw std::runtime_error("wifi_tx: unsupported format");
     if (p.bw == 40)

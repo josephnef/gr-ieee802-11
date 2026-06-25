@@ -84,7 +84,10 @@ HT20 2×2 MIMO** — is over-the-air validated against real Realtek silicon.
 - **LDPC TX** is **HT20 MCS 0 only** so far (single R=1/2 n=648 codeword; the
   multi-codeword / 1296 / 1944 / shorten-puncture-repeat selection and 40 MHz LDPC
   tone mapping are not yet wired up).
-- **VHT TX** is 20 MHz, NSS = 1, MCS 0–7 (no 256-QAM, no 40/80/160 MHz).
+- **VHT TX** covers 20/40 MHz, NSS = 1, MCS 0–9 (256-QAM included). NSS = 2 and 80/160 MHz
+  are not yet wired up. (256-QAM and 40 MHz at high MCS need a high link SNR to decode
+  over the air — VHT20 MCS8 and VHT40 MCS0 are chip-validated; the modulation is bit-exact
+  to GR-WiFi.)
 - The RX, the chip-correct TX and the sdr2wifi synthetic generator all use the 802.11
   spec cycling DATA pilots and the standard STBC HT-LTF P-matrix, so the TX↔RX self-loop
   decodes HT/HT40/VHT/STBC/LDPC-HT DATA. Decoding a *real chip* HT40/VHT frame's SIG
