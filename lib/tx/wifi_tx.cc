@@ -723,23 +723,10 @@ vcf ht20_data_freq(const vcf& pts, int j)
     vcf freq(64, cf(0, 0));
     for (int c = 0; c < 52; c++)
         freq[DATA_SC_HT[c]] = pts[c];
+    // Chip cycling DATA pilots: base {1,1,1,-1} rotated by the data-symbol index, times
+    // POLARITY[3+j] (same as non-STBC HT; chip-validated).
     const int htp_base[4] = { 1, 1, 1, -1 };
-    // TX_STBC_RXPILOT: emit the fork RX's fixed-pilot convention (base {1,1,1,-1} *
-    // POLARITY[OFDM_sym-2], STBC data starts at OFDM sym 8) for headless self-loop
-    // validation of the Alamouti/P-matrix DSP. Default = chip cycling pilots.
-    if (std::getenv("TX_STBC_RXPILOT")) {
-        float pol = POLARITY[((8 + j - 2) % 127 + 127) % 127];
-        for (int i = 0; i < 4; i++)
-            freq[PILOT_SC[i]] = cf(htp_base[i] * pol, 0);
-        return freq;
-    }
-    // Chip cycling pilots: base rotated by data-symbol index, * POLARITY[off+j].
-    // off defaults to 3 (the HT20 chip-validated value); TX_STBC_POL sweeps it for
-    // STBC bring-up, where the extra HT-LTF symbol may shift the polarity index.
-    int off = 3;
-    if (const char* e = std::getenv("TX_STBC_POL"))
-        off = std::atoi(e);
-    float pol = POLARITY[((off + j) % 127 + 127) % 127];
+    float pol = POLARITY[(3 + j) % 127];
     for (int i = 0; i < 4; i++)
         freq[PILOT_SC[i]] = cf(htp_base[(i + j) % 4] * pol, 0);
     return freq;
@@ -809,10 +796,15 @@ std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
     both(hs0);
     both(hs1);
     both(htstf);
+    // HT-LTF P-matrix = standard 802.11 [[1,-1],[1,1]]: STS0=[+,-], STS1=[+,+]. A real
+    // RTL8812AU uses this (confirmed by separating a chip-transmitted STBC frame on two
+    // B210 RX channels); the fork RX's [[1,1],[-1,1]] does NOT match silicon, so the
+    // earlier self-loop validation was circular. Wrong P -> the chip's per-STS channel
+    // estimate swaps/negates -> the Alamouti DATA combine fails CRC.
     append(a0, ofdm_symbol(ltf_p));
-    append(a0, ofdm_symbol(ltf_p)); // STS0 LTF [+,+]
-    append(a1, ofdm_symbol(ltf_n));
-    append(a1, ofdm_symbol(ltf_p)); // STS1 LTF [-,+]
+    append(a0, ofdm_symbol(ltf_n)); // STS0 LTF [+,-]
+    append(a1, ofdm_symbol(ltf_p));
+    append(a1, ofdm_symbol(ltf_p)); // STS1 LTF [+,+]
     for (int i = 0; i < nsym; i += 2) {
         const vcf& s0 = F[i];
         const vcf& s1 = F[i + 1];
