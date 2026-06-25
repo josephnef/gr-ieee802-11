@@ -1110,6 +1110,124 @@ std::vector<vcf> build_mimo(const uint8_t* psdu, int length, const tx_params& p)
     return { a0, a1 };
 }
 
+// VHT-LTF (20 MHz) for NSS=2, spatial stream ss, LTF symbol ltf. Data tones are scaled by
+// the VHT-LTF P-matrix C_P_LTF_VHT (stream0=[1,-1], stream1=[1,1]); the 4 pilot tones by
+// C_R_LTF_VHT=[1,-1] -- so stream1's 2nd LTF has its pilot tones negated vs its data tones.
+vcf vht_ltf_nss2_freq(int ss, int ltf)
+{
+    static const int Pm[2][2] = { { 1, -1 }, { 1, 1 } };
+    static const int Rm[2] = { 1, -1 };
+    vcf base = vhtltf20_freq();
+    vcf f(64, cf(0, 0));
+    for (int b = 4; b <= 60; b++) {
+        bool pilot = (b == PILOT_SC[0] || b == PILOT_SC[1] || b == PILOT_SC[2] || b == PILOT_SC[3]);
+        f[b] = base[b] * (float)(pilot ? Rm[ltf] : Pm[ss][ltf]);
+    }
+    return f;
+}
+
+// VHT20 NSS=2 (2 spatial streams, MCS 0-8 per stream, BCC). Mirrors build_mimo (HT) with
+// VHT framing: VHT-SIG-A with NSTS=2, 2 VHT-LTF via the C_P/C_R LTF matrices, VHT-SIG-B on
+// both streams, VHT DATA stream-parsed across 2 antennas. STS0 unshifted; STS1 gets CSD.
+// The VHT DATA pilots are stream-independent (the same cycling {1,1,1,-1} x POLARITY[4+j]
+// on both streams -- streams are separated by the VHT-LTF + CSD, not the pilots).
+std::vector<vcf> build_vht_mimo(const uint8_t* mpdu, int mpdu_len, const tx_params& p)
+{
+    const mcs_row& m = VHT_MCS20[p.mcs];
+    const int n_ss = 2;
+    vb ampdu = ampdu_wrap(mpdu, mpdu_len);
+    int alen = (int)ampdu.size();
+    int n_dbps_tot = n_ss * m.n_dbps;
+    int nsym = (16 + 8 * alen + 6 + n_dbps_tot - 1) / n_dbps_tot;
+    int n_ltf = 2;
+    const cf sigpil[4] = { cf(1, 0), cf(1, 0), cf(1, 0), cf(-1, 0) };
+    const int C_L = -4, C_HT = -8;
+
+    // L-SIG.
+    int txtime = 20 + 8 + 4 + 4 * n_ltf + 4 + 4 * nsym;
+    int lsig_len = 3 * ((txtime - 20 + 3) / 4) - 3;
+    vcf lsig_f = data_symbol_freq(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2,
+                                  false, false);
+
+    // VHT-SIG-A: B0-1 BW=20, reserved B2/B23/B33=1, NSTS-1=1 -> B10=1, MCS B28-31.
+    vb a(48, 0);
+    a[2] = 1;
+    a[10] = 1; // NSTS - 1 = 1 (2 streams)
+    a[23] = 1;
+    a[33] = 1;
+    for (int i = 0; i < 4; i++)
+        a[28 + i] = (p.mcs >> i) & 1;
+    uint8_t acrc = ht_sig_crc8(vb(a.begin(), a.begin() + 34));
+    for (int i = 0; i < 8; i++)
+        a[34 + i] = (acrc >> (7 - i)) & 1;
+    vb a_il = interleave_legacy(conv_encode(a), 48, 1);
+    vcf sa1_f = data_symbol_freq(map_bpsk(vb(a_il.begin(), a_il.begin() + 48)), DATA_SC_LEGACY,
+                                 48, 3, false, false, sigpil);
+    vcf sa2_f = data_symbol_freq(map_bpsk(vb(a_il.begin() + 48, a_il.end())), DATA_SC_LEGACY,
+                                 48, 4, true, false, sigpil);
+
+    // VHT-SIG-B (26 bits, 20 MHz); CRC-8 over B0-19 seeds DATA SERVICE[8:16].
+    int apep = alen / 4;
+    vb b(26, 0);
+    for (int i = 0; i < 17; i++)
+        b[i] = (apep >> i) & 1;
+    b[17] = b[18] = b[19] = 1;
+    uint8_t bcrc = ht_sig_crc8(vb(b.begin(), b.begin() + 20));
+    vb b_il = interleave_ht(conv_encode(b), 52, 1, 20);
+    vcf sb_f = data_symbol_freq(map_bpsk(b_il), DATA_SC_HT, 52, 7, false, false, sigpil);
+
+    // DATA bits -> scramble -> BCC -> puncture -> stream-parse(2).
+    vb data_bits(nsym * n_dbps_tot, 0);
+    for (int i = 0; i < 8; i++)
+        data_bits[8 + i] = (bcrc >> (7 - i)) & 1; // SERVICE[8:16]
+    vb abits = bytes_to_bits(ampdu.data(), alen);
+    for (size_t i = 0; i < abits.size(); i++)
+        data_bits[16 + i] = abits[i];
+    vb scr = scramble(data_bits);
+    for (int i = 0; i < 6; i++)
+        scr[16 + 8 * alen + i] = 0;
+    vb coded = puncture(conv_encode(scr), m.rnum, m.rden);
+    std::vector<vb> parts = stream_parse(coded, n_ss, m.n_bpsc, m.n_cbps);
+    vb il0 = interleave_ht_ss(parts[0], m.n_cbps, m.n_bpsc, 0);
+    vb il1 = interleave_ht_ss(parts[1], m.n_cbps, m.n_bpsc, 1);
+
+    // VHT DATA symbol (stream-independent cycling pilots, VHT polarity start 4).
+    static const int htp_base[4] = { 1, 1, 1, -1 };
+    auto vht_data = [&](const vb& il, int j) {
+        vb chunk(il.begin() + j * m.n_cbps, il.begin() + (j + 1) * m.n_cbps);
+        vcf pts = map_qam(chunk, m.n_bpsc);
+        vcf freq(64, cf(0, 0));
+        for (int c = 0; c < 52; c++)
+            freq[DATA_SC_HT[c]] = pts[c];
+        float pol = POLARITY[(4 + j) % 127];
+        for (int i = 0; i < 4; i++)
+            freq[PILOT_SC[i]] = cf(htp_base[(i + j) % 4] * pol, 0);
+        return freq;
+    };
+
+    // Assemble. STS0 (ant0) unshifted; STS1 (ant1) CSD: legacy fields C_L, VHT fields C_HT.
+    vcf a0 = preamble(), a1 = preamble_csd(C_L);
+    append(a0, ofdm_symbol(lsig_f));
+    append(a0, ofdm_symbol(sa1_f));
+    append(a0, ofdm_symbol(sa2_f));
+    append(a0, ofdm_symbol(lstf_freq())); // VHT-STF
+    append(a1, ofdm_symbol(apply_csd(lsig_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(sa1_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(sa2_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(lstf_freq(), C_HT))); // VHT-STF
+    for (int ltf = 0; ltf < 2; ltf++) {
+        append(a0, ofdm_symbol(vht_ltf_nss2_freq(0, ltf)));
+        append(a1, ofdm_symbol(apply_csd(vht_ltf_nss2_freq(1, ltf), C_HT)));
+    }
+    append(a0, ofdm_symbol(sb_f)); // VHT-SIG-B (same content on both streams)
+    append(a1, ofdm_symbol(apply_csd(sb_f, C_HT)));
+    for (int j = 0; j < nsym; j++) {
+        append(a0, ofdm_symbol(vht_data(il0, j)));
+        append(a1, ofdm_symbol(apply_csd(vht_data(il1, j), C_HT)));
+    }
+    return { a0, a1 };
+}
+
 std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
                                          const tx_params& p)
 {
@@ -1124,6 +1242,11 @@ std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
     if (p.format == TX_VHT) {
         if (p.fec != TX_BCC)
             throw std::runtime_error("wifi_tx: VHT LDPC not supported (so far)");
+        if (p.n_ss == 2) {
+            if (p.bw != 20 || p.mcs > 8)
+                throw std::runtime_error("wifi_tx: VHT NSS=2 only 20 MHz MCS0-8 (so far)");
+            return build_vht_mimo(psdu, psdu_len, p);
+        }
         if (p.bw == 20) {
             // VHT20 NSS=1: MCS 0-8 (MCS9 256-QAM r5/6 has non-integer n_dbps at 20 MHz).
             if (p.mcs > 8)
