@@ -85,10 +85,11 @@ HT20 2×2 MIMO** — is over-the-air validated against real Realtek silicon.
   multi-codeword / 1296 / 1944 / shorten-puncture-repeat selection and 40 MHz LDPC
   tone mapping are not yet wired up).
 - **VHT TX** is 20 MHz, NSS = 1, MCS 0–7 (no 256-QAM, no 40/80/160 MHz).
-- The TX↔RX pilot conventions diverged during chip bring-up: the chip-correct TX uses
-  the spec cycling pilots, while this fork's RX (and the synthetic generator in
-  sdr2wifi) still use the older fixed-pilot convention. Aligning the RX to the spec
-  cycling pilots is a pending follow-up.
+- The RX, the chip-correct TX and the sdr2wifi synthetic generator all use the 802.11
+  spec cycling DATA pilots and the standard STBC HT-LTF P-matrix, so the TX↔RX self-loop
+  decodes HT/HT40/VHT/STBC/LDPC-HT DATA. Decoding a *real chip* HT40/VHT frame's SIG
+  fields end-to-end still needs the HT40 HT-SIG sniff to accept the spec reserved bits
+  and the VHT-SIG-B decode to match silicon — a pending RX-SIG follow-up.
 
 ## How this relates to the two reference projects
 
