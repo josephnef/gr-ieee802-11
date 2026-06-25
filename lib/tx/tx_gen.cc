@@ -58,7 +58,9 @@ int main(int argc, char** argv)
     p.mcs = (fmt == "mimo") ? 8 + mcs : mcs;
     p.bw = bw;
 
-    auto psdu = make_psdu(24);
+    // TX_LEN overrides the MPDU payload length (>24 exercises multi-codeword LDPC).
+    const char* lenenv = std::getenv("TX_LEN");
+    auto psdu = make_psdu(lenenv ? atoi(lenenv) : 24);
     auto built = tx::build_frame(psdu.data(), (int)psdu.size(), p);
     // STBC is 2 antennas. STBC_2ANT=1 keeps them separate (-> <out> = ant0, <out>.ant1
     // = ant1) for the 2-channel B210 harness; otherwise the headless self-loop uses the
