@@ -94,6 +94,23 @@ vcf ofdm_symbol(const vcf& freq, int cp = -1)
     return out;
 }
 
+// Cyclic-shift diversity (802.11-2016 19.3.11.9): a tcs-sample cyclic time shift applied
+// as a per-subcarrier phase ramp exp(-j2pi (i-N/2) tcs / N) in the frequency domain
+// (centered subcarrier index i-N/2). Used to decorrelate TX antenna 1's (STS1) legacy
+// preamble + HT fields from antenna 0 so a 2-stream transmission does not beamform a null;
+// the receiver's per-STS channel estimate absorbs the shift. STS0 uses tcs=0 (identity).
+vcf apply_csd(vcf freq, int tcs)
+{
+    if (tcs == 0)
+        return freq;
+    int N = (int)freq.size();
+    for (int i = 0; i < N; i++) {
+        double ph = -2.0 * M_PI * (i - N / 2.0) * tcs / N;
+        freq[i] *= cf((float)std::cos(ph), (float)std::sin(ph));
+    }
+    return freq;
+}
+
 vcf lstf_freq()
 {
     vcf f(64, cf(0, 0));
@@ -256,8 +273,10 @@ vcf map_qam(const vb& coded, int n_bpsc)
 // the legacy/SIG pilots PILOT_VAL * POLARITY[sym_idx-2] are used. HT DATA symbols pass
 // an override (cyclically-rotated pattern + the HT polarity index) -- the spec the chip
 // requires; the legacy/SIG path keeps the simple computation.
-vcf data_symbol(vcf pts, const int* data_sc, int n_data, int sym_idx, bool rotate,
-                bool pilot_rotate, const cf* pilot_override = nullptr)
+// The frequency-domain content of one (L-)SIG / data symbol, before IFFT. Split out so
+// the CSD path (apply_csd) can shift antenna 1's copy before ofdm_symbol().
+vcf data_symbol_freq(vcf pts, const int* data_sc, int n_data, int sym_idx, bool rotate,
+                     bool pilot_rotate, const cf* pilot_override = nullptr)
 {
     vcf freq(64, cf(0, 0));
     if (rotate)
@@ -274,7 +293,14 @@ vcf data_symbol(vcf pts, const int* data_sc, int n_data, int sym_idx, bool rotat
             freq[PILOT_SC[i]] =
                 cf(PILOT_VAL[i] * p, 0) * (pilot_rotate ? cf(0, 1) : cf(1, 0));
     }
-    return ofdm_symbol(freq);
+    return freq;
+}
+
+vcf data_symbol(vcf pts, const int* data_sc, int n_data, int sym_idx, bool rotate,
+                bool pilot_rotate, const cf* pilot_override = nullptr)
+{
+    return ofdm_symbol(
+        data_symbol_freq(pts, data_sc, n_data, sym_idx, rotate, pilot_rotate, pilot_override));
 }
 
 vb bytes_to_bits(const uint8_t* data, int len)
@@ -308,9 +334,11 @@ vb sig_field(int rate4, int length12)
 
 void append(vcf& dst, const vcf& src) { dst.insert(dst.end(), src.begin(), src.end()); }
 
-vcf preamble()
+// Legacy preamble (L-STF 160 + L-LTF GI2+2x64) with an optional cyclic shift tcs applied
+// to both fields (for STS1 CSD). tcs=0 is the unshifted antenna-0 / SISO preamble.
+vcf preamble_csd(int tcs)
 {
-    vcf st = ifft_sym(lstf_freq());
+    vcf st = ifft_sym(apply_csd(lstf_freq(), tcs));
     vcf out;
     for (int rep = 0; rep < 10; rep++)
         for (int i = 0; i < 16; i++)
@@ -318,13 +346,15 @@ vcf preamble()
     vcf longv(64);
     for (int i = 0; i < 64; i++)
         longv[i] = cf((float)LONG[i], 0);
-    vcf lt = ifft_sym(longv);
+    vcf lt = ifft_sym(apply_csd(longv, tcs));
     for (int i = 32; i < 64; i++)
         out.push_back(lt[i]); // GI2
     append(out, lt);
     append(out, lt); // L-LTF: 2x64
     return out;
 }
+
+vcf preamble() { return preamble_csd(0); }
 
 // HT-LTF20 = L-LTF + the HT edge tones (sc +-27,+-28 -> bins 4,5,59,60).
 vcf htltf20_freq()
@@ -733,8 +763,8 @@ vcf ht20_data_freq(const vcf& pts, int j)
 }
 
 // HT20 STBC: 1 spatial stream -> 2 space-time streams (Alamouti), 2 TX antennas.
-// Per the RX inverse (frame_equalizer stbc_estimate_ltf / stbc_data_symbol): HT-LTF
-// P-matrix STS0=[+,+] STS1=[-,+]; Alamouti slot A: ant0=s0, ant1=-conj(s1); slot B:
+// Per the RX inverse (frame_equalizer stbc_estimate_ltf / stbc_data_symbol): standard
+// HT-LTF P-matrix STS0=[+,-] STS1=[+,+]; Alamouti slot A: ant0=s0, ant1=-conj(s1); slot B:
 // ant0=s1, ant1=conj(s0). MCS 0-7 BCC. (Pilots ride STS0.) Returns {ant0, ant1}.
 std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
 {
@@ -744,13 +774,11 @@ std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
         nsym++; // Alamouti pairs OFDM symbols -> need an even count
     int n_ltf = 2;
 
-    // Shared preamble + L-SIG + HT-SIG (STBC=1) + HT-STF (both antennas identical;
-    // cyclic-shift diversity for the over-air 2-antenna case is a TODO -- omitted here,
-    // it is absorbed into the channel estimate for the summed-stream validation).
-    vcf pre = preamble();
+    // Preamble + L-SIG + HT-SIG (STBC=1) + HT-STF, built in the frequency domain so
+    // antenna 1 (STS1) can be cyclic-shifted independently (CSD, below).
     int lsig_len = lsig_length_ht(nsym, n_ltf);
-    vcf lsig = data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2, false,
-                           false);
+    vcf lsig_f = data_symbol_freq(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2,
+                                  false, false);
     vb hsig(48, 0);
     for (int i = 0; i < 7; i++)
         hsig[i] = (p.mcs >> i) & 1;
@@ -762,13 +790,15 @@ std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
     for (int i = 0; i < 8; i++)
         hsig[34 + i] = (crc >> (7 - i)) & 1;
     vb hsig_il = interleave_legacy(conv_encode(hsig), 48, 1);
-    vcf hs0 = data_symbol(map_bpsk(vb(hsig_il.begin(), hsig_il.begin() + 48)),
-                          DATA_SC_LEGACY, 48, 3, true, false);
-    vcf hs1 = data_symbol(map_bpsk(vb(hsig_il.begin() + 48, hsig_il.end())),
-                          DATA_SC_LEGACY, 48, 4, true, false);
-    vcf htstf = ofdm_symbol(lstf_freq());
+    vcf hs0_f = data_symbol_freq(map_bpsk(vb(hsig_il.begin(), hsig_il.begin() + 48)),
+                                 DATA_SC_LEGACY, 48, 3, true, false);
+    vcf hs1_f = data_symbol_freq(map_bpsk(vb(hsig_il.begin() + 48, hsig_il.end())),
+                                 DATA_SC_LEGACY, 48, 4, true, false);
 
-    // HT-LTF P-matrix [[1,1],[-1,1]] (rows=STS, cols=LTF symbol).
+    // HT-LTF P-matrix = standard 802.11 [[1,-1],[1,1]]: STS0=[+,-], STS1=[+,+]. A real
+    // RTL8812AU uses this (confirmed by separating a chip-transmitted STBC frame on two
+    // B210 RX channels). Wrong P -> the chip's per-STS channel estimate swaps/negates
+    // -> the Alamouti DATA combine fails CRC.
     vcf ltf_p = htltf20_freq();
     vcf ltf_n(64);
     for (int i = 0; i < 64; i++)
@@ -790,21 +820,24 @@ std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
         F[j] = ht20_data_freq(map_qam(chunk, m.n_bpsc), j);
     }
 
-    vcf a0 = pre, a1 = pre;
-    auto both = [&](const vcf& s) { append(a0, s); append(a1, s); };
-    both(lsig);
-    both(hs0);
-    both(hs1);
-    both(htstf);
-    // HT-LTF P-matrix = standard 802.11 [[1,-1],[1,1]]: STS0=[+,-], STS1=[+,+]. A real
-    // RTL8812AU uses this (confirmed by separating a chip-transmitted STBC frame on two
-    // B210 RX channels); the fork RX's [[1,1],[-1,1]] does NOT match silicon, so the
-    // earlier self-loop validation was circular. Wrong P -> the chip's per-STS channel
-    // estimate swaps/negates -> the Alamouti DATA combine fails CRC.
+    // Antenna 0 (STS0): no cyclic shift. Antenna 1 (STS1): legacy fields (L-STF/L-LTF/
+    // L-SIG/HT-SIG) shifted by C_L, HT fields (HT-STF/HT-LTF/DATA) by C_HT -- 802.11
+    // 2-stream cyclic-shift diversity. The chip absorbs the shift into its per-STS
+    // channel estimate, so STBC still decodes; CSD decorrelates the antennas over the air.
+    const int C_L = -4, C_HT = -8; // -200 ns / -400 ns at 20 MHz (C_CYCLIC_SHIFT[1])
+    vcf a0 = preamble(), a1 = preamble_csd(C_L);
+    append(a0, ofdm_symbol(lsig_f));
+    append(a0, ofdm_symbol(hs0_f));
+    append(a0, ofdm_symbol(hs1_f));
+    append(a0, ofdm_symbol(lstf_freq())); // HT-STF
     append(a0, ofdm_symbol(ltf_p));
     append(a0, ofdm_symbol(ltf_n)); // STS0 LTF [+,-]
-    append(a1, ofdm_symbol(ltf_p));
-    append(a1, ofdm_symbol(ltf_p)); // STS1 LTF [+,+]
+    append(a1, ofdm_symbol(apply_csd(lsig_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(hs0_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(hs1_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(lstf_freq(), C_HT))); // HT-STF
+    append(a1, ofdm_symbol(apply_csd(ltf_p, C_HT)));
+    append(a1, ofdm_symbol(apply_csd(ltf_p, C_HT))); // STS1 LTF [+,+]
     for (int i = 0; i < nsym; i += 2) {
         const vcf& s0 = F[i];
         const vcf& s1 = F[i + 1];
@@ -814,9 +847,9 @@ std::vector<vcf> build_stbc(const uint8_t* psdu, int length, const tx_params& p)
             s0c[k] = std::conj(s0[k]);
         }
         append(a0, ofdm_symbol(s0));
-        append(a0, ofdm_symbol(s1));   // STS0: s0, s1
-        append(a1, ofdm_symbol(ms1c));
-        append(a1, ofdm_symbol(s0c));  // STS1: -conj(s1), conj(s0)
+        append(a0, ofdm_symbol(s1)); // STS0: s0, s1
+        append(a1, ofdm_symbol(apply_csd(ms1c, C_HT)));
+        append(a1, ofdm_symbol(apply_csd(s0c, C_HT))); // STS1: -conj(s1), conj(s0)
     }
     return { a0, a1 };
 }
@@ -883,7 +916,8 @@ vcf mimo_data_freq(const vcf& pts, int ss, int j)
 }
 
 // 2x2 HT MIMO (MCS 8-15). Returns {ant0=STS0, ant1=STS1}. STS0 has zero cyclic shift
-// (matches a spec stream-0 capture); STS1 CSD for the over-air case is a follow-up.
+// (matches a spec stream-0 capture); STS1 is cyclic-shifted (CSD) to decorrelate the two
+// TX antennas over the air -- legacy fields -200 ns, HT fields -400 ns.
 std::vector<vcf> build_mimo(const uint8_t* psdu, int length, const tx_params& p)
 {
     int mcs8 = p.mcs - 8; // 0..7 per-stream index
@@ -893,10 +927,9 @@ std::vector<vcf> build_mimo(const uint8_t* psdu, int length, const tx_params& p)
     int nsym = (16 + 8 * length + 6 + n_dbps_tot - 1) / n_dbps_tot;
     int n_ltf = 2;
 
-    vcf a0 = preamble(), a1 = preamble();
-    auto both = [&](const vcf& s) { append(a0, s); append(a1, s); };
     int lsig_len = lsig_length_ht(nsym, n_ltf);
-    both(data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2, false, false));
+    vcf lsig_f = data_symbol_freq(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2,
+                                  false, false);
     // HT-SIG: MCS 8-15 (2 SS), reserved bits 24/25/26=1, no STBC/LDPC.
     vb hsig(48, 0);
     for (int i = 0; i < 7; i++)
@@ -908,18 +941,32 @@ std::vector<vcf> build_mimo(const uint8_t* psdu, int length, const tx_params& p)
     for (int i = 0; i < 8; i++)
         hsig[34 + i] = (crc >> (7 - i)) & 1;
     vb hi = interleave_legacy(conv_encode(hsig), 48, 1);
-    both(data_symbol(map_bpsk(vb(hi.begin(), hi.begin() + 48)), DATA_SC_LEGACY, 48, 3, true, false));
-    both(data_symbol(map_bpsk(vb(hi.begin() + 48, hi.end())), DATA_SC_LEGACY, 48, 4, true, false));
-    both(ofdm_symbol(lstf_freq())); // HT-STF
+    vcf hs0_f = data_symbol_freq(map_bpsk(vb(hi.begin(), hi.begin() + 48)), DATA_SC_LEGACY,
+                                 48, 3, true, false);
+    vcf hs1_f = data_symbol_freq(map_bpsk(vb(hi.begin() + 48, hi.end())), DATA_SC_LEGACY, 48,
+                                 4, true, false);
 
     // HT-LTF: 2 symbols, standard P-matrix [[1,-1],[1,1]] (STS0=[+,-], STS1=[+,+]).
     vcf ltf_p = htltf20_freq(), ltf_n(64);
     for (int i = 0; i < 64; i++)
         ltf_n[i] = -ltf_p[i];
+
+    // STS0 (ant0): no cyclic shift. STS1 (ant1): legacy fields shifted by C_L, HT fields
+    // by C_HT -- 802.11 2-stream cyclic-shift diversity to decorrelate the antennas.
+    const int C_L = -4, C_HT = -8;
+    vcf a0 = preamble(), a1 = preamble_csd(C_L);
+    append(a0, ofdm_symbol(lsig_f));
+    append(a0, ofdm_symbol(hs0_f));
+    append(a0, ofdm_symbol(hs1_f));
+    append(a0, ofdm_symbol(lstf_freq())); // HT-STF
     append(a0, ofdm_symbol(ltf_p));
     append(a0, ofdm_symbol(ltf_n)); // STS0 LTF [+,-]
-    append(a1, ofdm_symbol(ltf_p));
-    append(a1, ofdm_symbol(ltf_p)); // STS1 LTF [+,+]
+    append(a1, ofdm_symbol(apply_csd(lsig_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(hs0_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(hs1_f, C_L)));
+    append(a1, ofdm_symbol(apply_csd(lstf_freq(), C_HT))); // HT-STF
+    append(a1, ofdm_symbol(apply_csd(ltf_p, C_HT)));
+    append(a1, ofdm_symbol(apply_csd(ltf_p, C_HT))); // STS1 LTF [+,+]
 
     // DATA: scramble -> BCC -> puncture -> stream-parse(2) -> per-stream interleave -> QAM.
     vb data_bits(nsym * n_dbps_tot, 0);
@@ -932,11 +979,13 @@ std::vector<vcf> build_mimo(const uint8_t* psdu, int length, const tx_params& p)
     vb coded = puncture(conv_encode(scr), m.rnum, m.rden);
     std::vector<vb> parts = stream_parse(coded, n_ss, m.n_bpsc, m.n_cbps);
     vcf* outs[2] = { &a0, &a1 };
+    const int data_tcs[2] = { 0, C_HT };
     for (int ss = 0; ss < n_ss; ss++) {
         vb il = interleave_ht_ss(parts[ss], m.n_cbps, m.n_bpsc, ss);
         for (int j = 0; j < nsym; j++) {
             vb chunk(il.begin() + j * m.n_cbps, il.begin() + (j + 1) * m.n_cbps);
-            append(*outs[ss], ofdm_symbol(mimo_data_freq(map_qam(chunk, m.n_bpsc), ss, j)));
+            append(*outs[ss], ofdm_symbol(apply_csd(
+                                  mimo_data_freq(map_qam(chunk, m.n_bpsc), ss, j), data_tcs[ss])));
         }
     }
     return { a0, a1 };
