@@ -46,6 +46,14 @@ private:
 
     virtual void reset();
 
+    // SSE2 soft-decision butterfly (overrides base's scalar one) — gives the
+    // soft path the same throughput as the hard decoder for real-time RX.
+    void soft_butterfly(unsigned char* symbols,
+                        unsigned char* mm0,
+                        unsigned char* mm1,
+                        unsigned char* pp0,
+                        unsigned char* pp1) override;
+
     void viterbi_chunks_init_sse2();
     void viterbi_butterfly2_sse2(
         unsigned char* symbols, __m128i m0[], __m128i m1[], __m128i p0[], __m128i p1[]);

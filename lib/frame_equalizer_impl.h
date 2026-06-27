@@ -103,7 +103,8 @@ private:
     int d_ht_nbpsc = 1;  // bits per subcarrier for the HT MCS
     int d_ht_ncbps = 52; // coded bits per HT OFDM symbol
     int d_ht_ndbps = 26; // data bits per HT OFDM symbol
-    uint8_t d_ht_rx_bits[MAX_ENCODED_BITS]; // accumulated coded bits
+    uint8_t d_ht_rx_bits[MAX_ENCODED_BITS]; // accumulated coded bits (hard)
+    uint8_t d_ht_rx_soft[MAX_ENCODED_BITS]; // per-coded-bit soft value 0..SOFT_Q
 
     // --- 802.11n 2x2 MIMO (MCS 8-15, HT20). Activated when n_rx==2 and
     // HT-SIG reports MCS 8-15. The 2 HT-LTF symbols (P-matrix) give a per-subcarrier

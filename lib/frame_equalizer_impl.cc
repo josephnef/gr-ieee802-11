@@ -895,6 +895,80 @@ void frame_equalizer_impl::ht_estimate_ltf20(const gr_complex* raw)
 // with pilot-based common-phase correction. HT (20 + 40) uses the HT-LTF channel
 // estimate (d_ht_h, covers the edge tones); VHT keeps the legacy L-LTF channel
 // (get_h) with edge extrapolation, since VHT estimates no d_ht_h at sym6.
+// Max-log per-bit soft LLR over the constellation points, quantised to the
+// Viterbi soft scale [0, SOFT_Q]. `q` = reliability that the coded bit is 1
+// (q < SOFT_NEUTRAL favours bit 0, matching decode_soft's convention). Each
+// point's bits are derived by calling decision_maker() ON THE POINT, so the
+// soft bit assignment is identical to the hard path regardless of the
+// constellation's internal index ordering (QAM decision_maker uses a threshold
+// cascade whose bit order differs from the points[] index order). GR_SOFT_SCALE
+// tunes the LLR->level slope: large enough that a clean symbol saturates to a
+// rail (clean frames decode exactly like hard), small enough that marginal
+// symbols land in between.
+template <typename ConstSptr>
+static inline void soft_demap_points(const gr_complex& sym, const ConstSptr& mod,
+                                     int nbpsc, float scale, uint8_t* q_out)
+{
+    const std::vector<gr_complex>& pts = mod->points();
+    const int M = (int)pts.size();
+    if (M < 2)
+        return;
+    // Each point's bits (from decision_maker, so the bit map matches the hard
+    // path) are CONSTANT per constellation — cache by M (the 4 modulations have
+    // distinct M). Recomputing them per subcarrier was the throughput killer
+    // (64 decision_maker calls per data carrier per OFDM symbol).
+    static unsigned int bits_cache[65][64];
+    static bool bits_done[65] = { false };
+    if (!bits_done[M]) {
+        for (int s = 0; s < M && s < 64; s++) {
+            gr_complex p = pts[s];
+            bits_cache[M][s] = mod->decision_maker(&p);
+        }
+        bits_done[M] = true;
+    }
+    const unsigned int* bits = bits_cache[M];
+    // Per-constellation min squared distance (cached by M). Normalising the LLR
+    // by it makes one GR_SOFT_SCALE work across BPSK/QPSK/16-/64-QAM, whose point
+    // spacings differ ~7x — without it a fixed scale that saturates a clean BPSK
+    // symbol leaves a clean 64-QAM symbol mushy (and it fails to decode).
+    static float dmin2_cache[65] = { 0.0f };
+    if (dmin2_cache[M] == 0.0f) {
+        float dm = 1e30f;
+        for (int a = 0; a < M && a < 64; a++)
+            for (int b = a + 1; b < M && b < 64; b++) {
+                const float dx = pts[a].real() - pts[b].real();
+                const float dy = pts[a].imag() - pts[b].imag();
+                const float d = dx * dx + dy * dy;
+                if (d > 0.0f && d < dm)
+                    dm = d;
+            }
+        dmin2_cache[M] = dm;
+    }
+    const float inv_dmin2 = 1.0f / dmin2_cache[M];
+    for (int k = 0; k < nbpsc; k++) {
+        float d0 = 1e30f, d1 = 1e30f;
+        for (int s = 0; s < M && s < 64; s++) {
+            const float dx = sym.real() - pts[s].real();
+            const float dy = sym.imag() - pts[s].imag();
+            const float dist = dx * dx + dy * dy;
+            if ((bits[s] >> k) & 1) {
+                if (dist < d1)
+                    d1 = dist;
+            } else {
+                if (dist < d0)
+                    d0 = dist;
+            }
+        }
+        const float llr = (d1 - d0) * inv_dmin2; // > 0 -> coded bit k == 0
+        int q = (int)lrintf((float)base::SOFT_NEUTRAL - scale * llr);
+        if (q < 0)
+            q = 0;
+        if (q > base::SOFT_Q)
+            q = base::SOFT_Q;
+        q_out[k] = (uint8_t)q;
+    }
+}
+
 void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
 {
     const bool ht40 = (d_fft_len == 128);
@@ -951,6 +1025,9 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
     } else if (d_ht_nbpsc == 4) {
         mod = d_16qam;
     }
+    static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
+    static const float soft_scale =
+        std::getenv("GR_SOFT_SCALE") ? (float)atof(std::getenv("GR_SOFT_SCALE")) : 8.0f;
     int b0 = d_ht_dsym * d_ht_ncbps;
     int c = 0;
     for (int i = lo; i <= hi_bin; i++) {
@@ -962,6 +1039,9 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
         for (int k = 0; k < d_ht_nbpsc; k++) {
             d_ht_rx_bits[b0 + c + k] = (val >> k) & 1;
         }
+        if (soft_on)
+            soft_demap_points(sym, mod, d_ht_nbpsc, soft_scale,
+                              &d_ht_rx_soft[b0 + c]);
         c += d_ht_nbpsc;
     }
     d_ht_dsym++;
@@ -984,6 +1064,12 @@ void frame_equalizer_impl::publish_pdu(const uint8_t* psdu, int len,
     pmt::pmt_t meta = pmt::make_dict();
     meta = pmt::dict_add(meta, pmt::mp("crc_ok"), pmt::from_bool(crc_ok));
     meta = pmt::dict_add(meta, pmt::mp("encoding"), pmt::from_uint64(encoding));
+    // SNR (L-LTF) + residual CFO, so a consumer can correlate decode failures
+    // with signal quality vs. impairment (a high-SNR FCS failure is a receiver
+    // correction defect, not noise).
+    meta = pmt::dict_add(meta, pmt::mp("snr"), pmt::from_double(d_equalizer->get_snr()));
+    meta = pmt::dict_add(meta, pmt::mp("freq_offset"),
+                         pmt::from_double(d_freq_offset_from_synclong));
     meta = pmt::dict_add(meta, pmt::mp("dlt"), pmt::from_long(105)); // LINKTYPE_IEEE802_11
     pmt::pmt_t blob = pmt::make_blob(psdu, len - 4); // strip FCS, like decode_mac
     message_port_pub(pmt::mp("pdu"), pmt::cons(meta, blob));
@@ -1045,7 +1131,24 @@ void frame_equalizer_impl::ht_finish()
         }
     }
 
-    uint8_t* decoded = d_decoder.decode(&ofdm, &frame, deint);
+    // GR_SOFT_VITERBI: feed the soft-decision Viterbi. d_ht_rx_soft carries one
+    // soft value per coded bit (0..SOFT_Q) when the soft demap ran; deinterleave
+    // it with the same permutation. Default path is the hard decode, untouched.
+    static const bool soft_viterbi = std::getenv("GR_SOFT_VITERBI") != nullptr;
+    uint8_t* decoded;
+    if (soft_viterbi) {
+        static uint8_t deint_soft[MAX_ENCODED_BITS];
+        for (int sym = 0; sym < d_ht_nsym; sym++) {
+            for (int k = 0; k < ncbps; k++) {
+                int i = n_row * (k % n_col) + (k / n_col);
+                int j = s * (i / s) + (i + ncbps - (n_col * i) / ncbps) % s;
+                deint_soft[sym * ncbps + k] = d_ht_rx_soft[sym * ncbps + j];
+            }
+        }
+        decoded = d_decoder.decode_soft(&ofdm, &frame, deint_soft);
+    } else {
+        decoded = d_decoder.decode(&ofdm, &frame, deint);
+    }
 
     // descramble (7-bit LFSR): SERVICE(16) + PSDU + tail
     int state = 0;
@@ -1380,6 +1483,15 @@ void frame_equalizer_impl::stbc_data_symbol(const gr_complex* raw, int sym_idx)
             for (int k = 0; k < d_ht_nbpsc; k++) {
                 d_ht_rx_bits[b0 + c + k] = (val >> k) & 1;
             }
+            // STBC reuses ht_finish, which reads d_ht_rx_soft under
+            // GR_SOFT_VITERBI — populate it here too (same max-log demap).
+            static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
+            static const float soft_scale = std::getenv("GR_SOFT_SCALE")
+                ? (float)atof(std::getenv("GR_SOFT_SCALE"))
+                : 8.0f;
+            if (soft_on)
+                soft_demap_points(sym, mod, d_ht_nbpsc, soft_scale,
+                                  &d_ht_rx_soft[b0 + c]);
             c += d_ht_nbpsc;
         }
         d_ht_dsym++;
