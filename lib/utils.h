@@ -38,6 +38,13 @@ using gr::ieee802_11::Encoding;
 // (HT40 = 108 data SC * up to 2 spatial streams = 216). Legacy uses 48 of these.
 #define MAX_DATA_CARRIERS 216
 
+// Per-OFDM-symbol item size of frame_equalizer's SOFT output port -> decode_mac's
+// soft input (GR_SOFT_VITERBI legacy path). Carries one soft byte per coded bit:
+// 48 legacy data carriers * up to 8 bits/carrier. Only the legacy decode consumes
+// it; HT/VHT/MIMO/STBC decode inside frame_equalizer. The port is always present
+// (fixed item size) so the hard path's stream topology is unchanged.
+#define LEGACY_SOFT_STRIDE (48 * 8)
+
 #define dout d_debug&& std::cout
 #define mylog(...)                      \
     do {                                \
