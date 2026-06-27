@@ -1272,12 +1272,18 @@ void frame_equalizer_impl::mimo_data_symbol(const gr_complex* r0,
         gr_complex x0 = (G11 * b0 - G01 * b1) / det;
         gr_complex x1 = (-G10 * b0 + G00 * b1) / det;
         gr_complex xs[2] = { x0, x1 };
+        static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
+        static const float soft_scale =
+            std::getenv("GR_SOFT_SCALE") ? (float)atof(std::getenv("GR_SOFT_SCALE")) : 8.0f;
         for (int ss = 0; ss < 2; ss++) {
             gr_complex sym = xs[ss];
             unsigned int val = mod->decision_maker(&sym);
             for (int k = 0; k < d_ht_nbpsc; k++) {
                 d_mimo_bits[ss][c[ss] + k] = (val >> k) & 1;
             }
+            if (soft_on)
+                soft_demap_points(sym, mod, d_ht_nbpsc, soft_scale,
+                                  &d_mimo_soft[ss][c[ss]]);
             c[ss] += d_ht_nbpsc;
         }
     }
@@ -1296,8 +1302,12 @@ void frame_equalizer_impl::mimo_finish()
     const int n_row = 4 * d_ht_nbpsc;
     const int n_rot = 11;
 
-    // per-stream deinterleave (with the 3rd-permutation rotation for stream>0)
+    static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
+
+    // per-stream deinterleave (with the 3rd-permutation rotation for stream>0).
+    // Soft values follow the SAME permutation when GR_SOFT_VITERBI is set.
     static uint8_t deint[2][MAX_ENCODED_BITS];
+    static uint8_t deint_soft[2][MAX_ENCODED_BITS];
     for (int ss = 0; ss < 2; ss++) {
         const int issp = ss + 1;
         const int jrot =
@@ -1308,18 +1318,23 @@ void frame_equalizer_impl::mimo_finish()
                 int j = s * (ii / s) + (ii + ncbps - (n_col * ii) / ncbps) % s;
                 int r = ((j - jrot) % ncbps + ncbps) % ncbps; // forward k -> position
                 deint[ss][sym * ncbps + k] = d_mimo_bits[ss][sym * ncbps + r];
+                if (soft_on)
+                    deint_soft[ss][sym * ncbps + k] = d_mimo_soft[ss][sym * ncbps + r];
             }
         }
     }
 
     // stream de-parse: s bits at a time, round-robin from the 2 streams -> one BCC seq
     static uint8_t deparsed[MAX_ENCODED_BITS];
+    static uint8_t deparsed_soft[MAX_ENCODED_BITS];
     int pos[2] = { 0, 0 }, idx = 0;
     const int blocks_per_sym = (2 * ncbps) / s;
     for (int sym = 0; sym < d_ht_nsym; sym++) {
         for (int blk = 0; blk < blocks_per_sym; blk++) {
             int ss = blk % 2;
             for (int b = 0; b < s; b++) {
+                if (soft_on)
+                    deparsed_soft[idx] = deint_soft[ss][pos[ss]];
                 deparsed[idx++] = deint[ss][pos[ss]++];
             }
         }
@@ -1330,7 +1345,8 @@ void frame_equalizer_impl::mimo_finish()
     ofdm.n_cbps *= 2;
     ofdm.n_dbps *= 2;
     frame_param frame(ofdm, d_ht_len);
-    uint8_t* decoded = d_decoder.decode(&ofdm, &frame, deparsed);
+    uint8_t* decoded = soft_on ? d_decoder.decode_soft(&ofdm, &frame, deparsed_soft)
+                               : d_decoder.decode(&ofdm, &frame, deparsed);
 
     int state = 0;
     static uint8_t out_bytes[MAX_PSDU_SIZE + 2];
