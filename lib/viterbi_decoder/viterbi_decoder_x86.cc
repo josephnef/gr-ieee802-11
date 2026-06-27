@@ -200,6 +200,136 @@ void viterbi_decoder::viterbi_butterfly2_sse2(
     }
 }
 
+// SSE2 soft-decision butterfly. Identical ACS/path to viterbi_butterfly2_sse2;
+// only the branch metric changes: inputs are soft values q in [0, SOFT_Q], the
+// mismatch is `mask ? (Q - q) : q` (mask = 0xFF where the expected coded bit is
+// 1), and punctured positions carry SOFT_NEUTRAL (no `== 2` special-case). The
+// branch table holds 0/1 bytes; cmpgt(.,0) turns it into the 0x00/0xFF mask.
+void viterbi_decoder::soft_butterfly(unsigned char* symbols,
+                                     unsigned char* mm0c,
+                                     unsigned char* mm1c,
+                                     unsigned char* pp0c,
+                                     unsigned char* pp1c)
+{
+    int i;
+    __m128i* mm0 = reinterpret_cast<__m128i*>(mm0c);
+    __m128i* mm1 = reinterpret_cast<__m128i*>(mm1c);
+    __m128i* pp0 = reinterpret_cast<__m128i*>(pp0c);
+    __m128i* pp1 = reinterpret_cast<__m128i*>(pp1c);
+
+    __m128i *metric0, *metric1, *path0, *path1;
+    metric0 = mm0;
+    path0 = pp0;
+    metric1 = mm1;
+    path1 = pp1;
+
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i Qv = _mm_set1_epi8((char)base::SOFT_Q);
+    const __m128i twoQv = _mm_set1_epi8((char)(2 * base::SOFT_Q));
+
+    __m128i m0, m1, m2, m3, decision0, decision1, survivor0, survivor1;
+    __m128i metsv, metsvm, shift0, shift1, tmp0, tmp1, sym0v, sym1v;
+
+    sym0v = _mm_set1_epi8(symbols[0]);
+    sym1v = _mm_set1_epi8(symbols[1]);
+
+    for (i = 0; i < 2; i++) {
+        __m128i mask0 = _mm_cmpgt_epi8(d_branchtab27_sse2[0].v[i], zero);
+        __m128i mask1 = _mm_cmpgt_epi8(d_branchtab27_sse2[1].v[i], zero);
+        __m128i mis0 = _mm_or_si128(_mm_and_si128(mask0, _mm_sub_epi8(Qv, sym0v)),
+                                    _mm_andnot_si128(mask0, sym0v));
+        __m128i mis1 = _mm_or_si128(_mm_and_si128(mask1, _mm_sub_epi8(Qv, sym1v)),
+                                    _mm_andnot_si128(mask1, sym1v));
+        metsvm = _mm_add_epi8(mis0, mis1);
+        metsv = _mm_sub_epi8(twoQv, metsvm);
+
+        m0 = _mm_add_epi8(metric0[i], metsv);
+        m1 = _mm_add_epi8(metric0[i + 2], metsvm);
+        m2 = _mm_add_epi8(metric0[i], metsvm);
+        m3 = _mm_add_epi8(metric0[i + 2], metsv);
+
+        // STRICT UNSIGNED compare (m > m'): soft metrics can exceed the signed
+        // int8 range (127) between normalisations at rate 5/6, where
+        // _mm_cmpgt_epi8 (signed) mis-decides; and the tie-break must match the
+        // scalar's strict `>` (pick the lower state on a tie) or the many ties
+        // from punctured/neutral positions at rate 5/6 diverge the path.
+        // m > m' (unsigned) = (max_epu8(m,m') == m) AND (m != m').
+        decision0 = _mm_andnot_si128(_mm_cmpeq_epi8(m0, m1),
+                                     _mm_cmpeq_epi8(_mm_max_epu8(m0, m1), m0));
+        decision1 = _mm_andnot_si128(_mm_cmpeq_epi8(m2, m3),
+                                     _mm_cmpeq_epi8(_mm_max_epu8(m2, m3), m2));
+        survivor0 =
+            _mm_or_si128(_mm_and_si128(decision0, m0), _mm_andnot_si128(decision0, m1));
+        survivor1 =
+            _mm_or_si128(_mm_and_si128(decision1, m2), _mm_andnot_si128(decision1, m3));
+
+        shift0 = _mm_slli_epi16(path0[i], 1);
+        shift1 = _mm_slli_epi16(path0[2 + i], 1);
+        shift1 = _mm_add_epi8(shift1, _mm_set1_epi8(1));
+
+        metric1[2 * i] = _mm_unpacklo_epi8(survivor0, survivor1);
+        tmp0 = _mm_or_si128(_mm_and_si128(decision0, shift0),
+                            _mm_andnot_si128(decision0, shift1));
+        metric1[2 * i + 1] = _mm_unpackhi_epi8(survivor0, survivor1);
+        tmp1 = _mm_or_si128(_mm_and_si128(decision1, shift0),
+                            _mm_andnot_si128(decision1, shift1));
+        path1[2 * i] = _mm_unpacklo_epi8(tmp0, tmp1);
+        path1[2 * i + 1] = _mm_unpackhi_epi8(tmp0, tmp1);
+    }
+
+    metric0 = mm1;
+    path0 = pp1;
+    metric1 = mm0;
+    path1 = pp0;
+
+    sym0v = _mm_set1_epi8(symbols[2]);
+    sym1v = _mm_set1_epi8(symbols[3]);
+
+    for (i = 0; i < 2; i++) {
+        __m128i mask0 = _mm_cmpgt_epi8(d_branchtab27_sse2[0].v[i], zero);
+        __m128i mask1 = _mm_cmpgt_epi8(d_branchtab27_sse2[1].v[i], zero);
+        __m128i mis0 = _mm_or_si128(_mm_and_si128(mask0, _mm_sub_epi8(Qv, sym0v)),
+                                    _mm_andnot_si128(mask0, sym0v));
+        __m128i mis1 = _mm_or_si128(_mm_and_si128(mask1, _mm_sub_epi8(Qv, sym1v)),
+                                    _mm_andnot_si128(mask1, sym1v));
+        metsvm = _mm_add_epi8(mis0, mis1);
+        metsv = _mm_sub_epi8(twoQv, metsvm);
+
+        m0 = _mm_add_epi8(metric0[i], metsv);
+        m1 = _mm_add_epi8(metric0[i + 2], metsvm);
+        m2 = _mm_add_epi8(metric0[i], metsvm);
+        m3 = _mm_add_epi8(metric0[i + 2], metsv);
+
+        // STRICT UNSIGNED compare (m > m'): soft metrics can exceed the signed
+        // int8 range (127) between normalisations at rate 5/6, where
+        // _mm_cmpgt_epi8 (signed) mis-decides; and the tie-break must match the
+        // scalar's strict `>` (pick the lower state on a tie) or the many ties
+        // from punctured/neutral positions at rate 5/6 diverge the path.
+        // m > m' (unsigned) = (max_epu8(m,m') == m) AND (m != m').
+        decision0 = _mm_andnot_si128(_mm_cmpeq_epi8(m0, m1),
+                                     _mm_cmpeq_epi8(_mm_max_epu8(m0, m1), m0));
+        decision1 = _mm_andnot_si128(_mm_cmpeq_epi8(m2, m3),
+                                     _mm_cmpeq_epi8(_mm_max_epu8(m2, m3), m2));
+        survivor0 =
+            _mm_or_si128(_mm_and_si128(decision0, m0), _mm_andnot_si128(decision0, m1));
+        survivor1 =
+            _mm_or_si128(_mm_and_si128(decision1, m2), _mm_andnot_si128(decision1, m3));
+
+        shift0 = _mm_slli_epi16(path0[i], 1);
+        shift1 = _mm_slli_epi16(path0[2 + i], 1);
+        shift1 = _mm_add_epi8(shift1, _mm_set1_epi8(1));
+
+        metric1[2 * i] = _mm_unpacklo_epi8(survivor0, survivor1);
+        tmp0 = _mm_or_si128(_mm_and_si128(decision0, shift0),
+                            _mm_andnot_si128(decision0, shift1));
+        metric1[2 * i + 1] = _mm_unpackhi_epi8(survivor0, survivor1);
+        tmp1 = _mm_or_si128(_mm_and_si128(decision1, shift0),
+                            _mm_andnot_si128(decision1, shift1));
+        path1[2 * i] = _mm_unpacklo_epi8(tmp0, tmp1);
+        path1[2 * i + 1] = _mm_unpackhi_epi8(tmp0, tmp1);
+    }
+}
+
 //  Find current best path
 unsigned char viterbi_decoder::viterbi_get_output_sse2(__m128i* mm0,
                                                        __m128i* pp0,

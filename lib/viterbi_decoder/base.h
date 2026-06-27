@@ -89,11 +89,13 @@ protected:
 
     void soft_init();
     uint8_t* depuncture_soft(uint8_t* in);
-    void soft_butterfly(unsigned char* symbols,
-                        unsigned char* mm0,
-                        unsigned char* mm1,
-                        unsigned char* pp0,
-                        unsigned char* pp1);
+    // Virtual so the x86 decoder can override with an SSE2 soft butterfly (the
+    // generic/non-x86 build uses this scalar one). decode_soft() calls it.
+    virtual void soft_butterfly(unsigned char* symbols,
+                                unsigned char* mm0,
+                                unsigned char* mm1,
+                                unsigned char* pp0,
+                                unsigned char* pp1);
     unsigned char soft_get_output(unsigned char* mm0,
                                   unsigned char* pp0,
                                   int ntraceback,

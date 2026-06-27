@@ -913,11 +913,20 @@ static inline void soft_demap_points(const gr_complex& sym, const ConstSptr& mod
     const int M = (int)pts.size();
     if (M < 2)
         return;
-    unsigned int bits[64];
-    for (int s = 0; s < M && s < 64; s++) {
-        gr_complex p = pts[s];
-        bits[s] = mod->decision_maker(&p);
+    // Each point's bits (from decision_maker, so the bit map matches the hard
+    // path) are CONSTANT per constellation — cache by M (the 4 modulations have
+    // distinct M). Recomputing them per subcarrier was the throughput killer
+    // (64 decision_maker calls per data carrier per OFDM symbol).
+    static unsigned int bits_cache[65][64];
+    static bool bits_done[65] = { false };
+    if (!bits_done[M]) {
+        for (int s = 0; s < M && s < 64; s++) {
+            gr_complex p = pts[s];
+            bits_cache[M][s] = mod->decision_maker(&p);
+        }
+        bits_done[M] = true;
     }
+    const unsigned int* bits = bits_cache[M];
     // Per-constellation min squared distance (cached by M). Normalising the LLR
     // by it makes one GR_SOFT_SCALE work across BPSK/QPSK/16-/64-QAM, whose point
     // spacings differ ~7x — without it a fixed scale that saturates a clean BPSK
@@ -1018,7 +1027,7 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
     }
     static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
     static const float soft_scale =
-        std::getenv("GR_SOFT_SCALE") ? (float)atof(std::getenv("GR_SOFT_SCALE")) : 6.0f;
+        std::getenv("GR_SOFT_SCALE") ? (float)atof(std::getenv("GR_SOFT_SCALE")) : 8.0f;
     int b0 = d_ht_dsym * d_ht_ncbps;
     int c = 0;
     for (int i = lo; i <= hi_bin; i++) {
@@ -1473,7 +1482,7 @@ void frame_equalizer_impl::stbc_data_symbol(const gr_complex* raw, int sym_idx)
             static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
             static const float soft_scale = std::getenv("GR_SOFT_SCALE")
                 ? (float)atof(std::getenv("GR_SOFT_SCALE"))
-                : 6.0f;
+                : 8.0f;
             if (soft_on)
                 soft_demap_points(sym, mod, d_ht_nbpsc, soft_scale,
                                   &d_ht_rx_soft[b0 + c]);
