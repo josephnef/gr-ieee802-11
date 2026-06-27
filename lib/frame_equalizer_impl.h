@@ -117,6 +117,7 @@ private:
     int d_mimo_ltf_seen = 0;
     gr_complex d_mimo_H[64][2][2];   // per-subcarrier 2x2 channel [sc][rx][stream]
     uint8_t d_mimo_bits[2][MAX_ENCODED_BITS]; // per-stream demapped coded bits (SC order)
+    uint8_t d_mimo_soft[2][MAX_ENCODED_BITS]; // per-stream soft values 0..SOFT_Q (GR_SOFT_VITERBI)
     void mimo_begin(int mcs, int len);
     void mimo_estimate_ltf();
     void mimo_data_symbol(const gr_complex* r0, const gr_complex* r1, int sym_idx);
