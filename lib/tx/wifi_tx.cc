@@ -782,20 +782,19 @@ std::vector<vcf> build_vht40(const uint8_t* mpdu, int mpdu_len, const tx_params&
 
 } // namespace
 
-// HT20 SISO LDPC (MCS0, R=1/2 n=648 single codeword). IEEE 802.11-2016 19.3.11.7.5:
-// IEEE 802.11-2016 19.3.11.7.5: select N_cw codewords of length L (648/1296/1944) matching
-// the MCS rate, distribute shortening + (puncturing | repetition) across codewords, encode
-// each, drop the shortening zeros and punctured/extra parity, aggregate. 20 MHz uses no
-// tone mapping (D_TM=1, identity -- confirmed against real RTL8812AU silicon; D_TM>1 makes
-// the chip's LDPC decoder fail). HT-SIG FEC bit (B30) = 1. HT20 MCS 0-7, any length.
-std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params& p)
+// LDPC data-bit generation (IEEE 802.11-2016 19.3.11.7.5): scramble SERVICE+PSDU, select
+// N_cw codewords of length L (648/1296/1944) matching the MCS rate, distribute shortening +
+// (puncturing | repetition) across codewords, encode each, drop the shortening zeros and
+// punctured/extra parity, aggregate. Returns the coded stream (N_sym * N_CBPS bits) and
+// N_sym by ref. Bandwidth-agnostic (shared by HT20 and HT40); N_CBPS/N_DBPS are the
+// per-symbol counts for the bandwidth.
+vb ldpc_coded_bits(const uint8_t* psdu, int length, int rnum, int rden, int N_DBPS,
+                   int N_CBPS, int& N_sym)
 {
-    const mcs_row& m = HT_MCS20[p.mcs];
-    const int N_CBPS = m.n_cbps, N_DBPS = m.n_dbps, rnum = m.rnum, rden = m.rden;
     int N_pld = 16 + 8 * length; // SERVICE(16) + PSDU; LDPC has no tail bits
 
     // Step a: N_sym, N_avbits (m_STBC = 1).
-    int N_sym = (N_pld + N_DBPS - 1) / N_DBPS;
+    N_sym = (N_pld + N_DBPS - 1) / N_DBPS;
     int N_avbits = N_sym * N_CBPS;
 
     // Step b: number of codewords N_cw and codeword length L.
@@ -818,8 +817,6 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
     }
     int Kcw = L * rnum / rden; // info bits per codeword
     int Mcw = L - Kcw;         // parity bits per codeword
-    // [DEBUG SWEEP] env knobs to disambiguate the multi-codeword distribution vs the chip's
-    // LDPC decoder; the winning combination becomes the default and the knobs are removed.
     // Steps c-e: shortening, puncturing (with the over-puncture guard), repetition (totals).
     int N_shrt = std::max(0, N_cw * Kcw - N_pld);
     int N_punc = std::max(0, N_cw * L - N_avbits - N_shrt);
@@ -830,30 +827,6 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
         N_punc = std::max(0, N_cw * L - N_avbits - N_shrt);
     }
     int N_rep = (N_punc == 0) ? std::max(0, N_avbits - (N_cw * L - N_shrt)) : 0;
-
-    vcf frame = preamble();
-    int lsig_len = lsig_length_ht(N_sym, 1);
-    append(frame, data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2,
-                              false, false));
-    // HT-SIG: same as BCC HT20 but B30 (FEC) = 1 (LDPC).
-    vb hsig(48, 0);
-    for (int i = 0; i < 7; i++)
-        hsig[i] = (p.mcs >> i) & 1;
-    for (int i = 0; i < 16; i++)
-        hsig[8 + i] = (length >> i) & 1;
-    hsig[24] = hsig[25] = hsig[26] = 1; // smoothing / not-sounding / reserved
-    hsig[30] = 1;                        // FEC = LDPC
-    vb hsig34(hsig.begin(), hsig.begin() + 34);
-    uint8_t crc = ht_sig_crc8(hsig34);
-    for (int i = 0; i < 8; i++)
-        hsig[34 + i] = (crc >> (7 - i)) & 1;
-    vb hsig_il = interleave_legacy(conv_encode(hsig), 48, 1);
-    append(frame, data_symbol(map_bpsk(vb(hsig_il.begin(), hsig_il.begin() + 48)),
-                              DATA_SC_LEGACY, 48, 3, true, false));
-    append(frame, data_symbol(map_bpsk(vb(hsig_il.begin() + 48, hsig_il.end())),
-                              DATA_SC_LEGACY, 48, 4, true, false));
-    append(frame, ofdm_symbol(lstf_freq()));
-    append(frame, ofdm_symbol(htltf20_freq()));
 
     // Payload bits (SERVICE 16 zeros + PSDU), scrambled, parsed across the codewords.
     vb db(N_pld, 0);
@@ -885,6 +858,59 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
     }
     for (int i = 0; i < N_rep; i++) // repetition: repeat the first N_rep coded bits
         coded.push_back(coded[i]);
+    return coded;
+}
+
+// LDPC tone mapping (IEEE 802.11-2016 19.3.11.7.5, Table 19-15). The N_SD constellation
+// points are spread across the data subcarriers with a tone-mapping distance D_TM so an
+// LDPC codeword's bits don't land on adjacent (correlated) tones. 20 MHz: D_TM=1 (identity).
+// 40 MHz: D_TM=6 -> a transpose of a (N_SD/D_TM) x D_TM grid: logical point k goes to
+// physical tone D_TM*(k mod N_SD/D_TM) + floor(k / (N_SD/D_TM)).
+vcf ldpc_tone_map(const vcf& pts, int d_tm)
+{
+    const int N_SD = (int)pts.size();
+    if (d_tm <= 1)
+        return pts;
+    const int rows = N_SD / d_tm;
+    vcf out(N_SD);
+    for (int k = 0; k < N_SD; k++)
+        out[d_tm * (k % rows) + k / rows] = pts[k];
+    return out;
+}
+
+// HT20 SISO LDPC (MCS 0-7). 20 MHz uses no tone mapping (D_TM=1, identity -- confirmed
+// against real RTL8812AU silicon; D_TM>1 makes the chip's LDPC decoder fail). HT-SIG FEC
+// bit (B30) = 1.
+std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params& p)
+{
+    const mcs_row& m = HT_MCS20[p.mcs];
+    const int N_CBPS = m.n_cbps;
+    int N_sym;
+    vb coded = ldpc_coded_bits(psdu, length, m.rnum, m.rden, m.n_dbps, N_CBPS, N_sym);
+
+    vcf frame = preamble();
+    int lsig_len = lsig_length_ht(N_sym, 1);
+    append(frame, data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 48, 2,
+                              false, false));
+    // HT-SIG: same as BCC HT20 but B30 (FEC) = 1 (LDPC).
+    vb hsig(48, 0);
+    for (int i = 0; i < 7; i++)
+        hsig[i] = (p.mcs >> i) & 1;
+    for (int i = 0; i < 16; i++)
+        hsig[8 + i] = (length >> i) & 1;
+    hsig[24] = hsig[25] = hsig[26] = 1; // smoothing / not-sounding / reserved
+    hsig[30] = 1;                        // FEC = LDPC
+    vb hsig34(hsig.begin(), hsig.begin() + 34);
+    uint8_t crc = ht_sig_crc8(hsig34);
+    for (int i = 0; i < 8; i++)
+        hsig[34 + i] = (crc >> (7 - i)) & 1;
+    vb hsig_il = interleave_legacy(conv_encode(hsig), 48, 1);
+    append(frame, data_symbol(map_bpsk(vb(hsig_il.begin(), hsig_il.begin() + 48)),
+                              DATA_SC_LEGACY, 48, 3, true, false));
+    append(frame, data_symbol(map_bpsk(vb(hsig_il.begin() + 48, hsig_il.end())),
+                              DATA_SC_LEGACY, 48, 4, true, false));
+    append(frame, ofdm_symbol(lstf_freq()));
+    append(frame, ofdm_symbol(htltf20_freq()));
 
     // Map the aggregated coded stream to N_sym symbols (no tone mapping at 20 MHz), with
     // cycling DATA pilots. MCS 0-7 via the per-MCS constellation (n_bpsc).
@@ -897,6 +923,63 @@ std::vector<vcf> build_ht_ldpc(const uint8_t* psdu, int length, const tx_params&
         for (int i = 0; i < 4; i++)
             pil[i] = cf(htp_base[(i + j) % 4] * pol, 0);
         append(frame, data_symbol(pts, DATA_SC_HT, 52, 7 + j, false, false, pil));
+    }
+    return { frame };
+}
+
+// HT40 SISO LDPC (MCS 0-7). Reuses ldpc_coded_bits with the HT40 per-symbol counts, the
+// HT40 geometry (128-FFT, 108 data SC, 6 pilots) from build_ht40, and the LDPC tone mapper.
+//
+// Tone mapping: like HT20 LDPC, the RTL8812AU's LDPC decoder needs IDENTITY (D_TM=1), not
+// the spec's D_TM=6 -- validated on-air (sdr2wifi scripts/tx_devourer_ht40_ldpc.sh: the
+// chip received 8 clean HT40 MCS0 LDPC frames at D_TM=1, 0 at D_TM=6, with HT40 BCC passing
+// as the channel-setup control). GR_LDPC_HT40_DTM overrides it for spec-compliant decoders.
+std::vector<vcf> build_ht40_ldpc(const uint8_t* psdu, int length, const tx_params& p)
+{
+    const mcs_row& m = HT_MCS40[p.mcs];
+    static const int d_tm =
+        std::getenv("GR_LDPC_HT40_DTM") ? atoi(std::getenv("GR_LDPC_HT40_DTM")) : 1;
+    int N_sym;
+    vb coded = ldpc_coded_bits(psdu, length, m.rnum, m.rden, m.n_dbps, m.n_cbps, N_sym);
+    std::vector<int> DSC = data_sc_ht40();
+
+    vcf frame = preamble40();
+
+    // L-SIG (dup40), spec length.
+    int txtime = 20 + 8 + 4 + 4 * 1 + 4 * N_sym;
+    int lsig_len = 3 * ((txtime - 20 + 3) / 4) - 3;
+    append(frame, sig_symbol_dup40(sig_field(11, lsig_len), 2, false));
+
+    // HT-SIG (dup40): MCS, CBW40=bit7=1, length, reserved 24/25/26=1, FEC(bit30)=1 (LDPC), CRC.
+    vb hsig(48, 0);
+    for (int i = 0; i < 7; i++)
+        hsig[i] = (p.mcs >> i) & 1;
+    hsig[7] = 1; // CBW40
+    for (int i = 0; i < 16; i++)
+        hsig[8 + i] = (length >> i) & 1;
+    hsig[24] = hsig[25] = hsig[26] = 1;
+    hsig[30] = 1; // FEC = LDPC
+    uint8_t crc = ht_sig_crc8(vb(hsig.begin(), hsig.begin() + 34));
+    for (int i = 0; i < 8; i++)
+        hsig[34 + i] = (crc >> (7 - i)) & 1;
+    vb hsig_il = interleave_legacy(conv_encode(hsig), 48, 1);
+    append(frame, sig_symbol_dup40(vb(hsig_il.begin(), hsig_il.begin() + 48), 3, true));
+    append(frame, sig_symbol_dup40(vb(hsig_il.begin() + 48, hsig_il.end()), 4, true));
+
+    // HT-STF40 (spec: L-STF dup) + HT-LTF40.
+    append(frame, ofdm_symbol(dup40(lstf_freq())));
+    append(frame, ofdm_symbol(htltf40_freq()));
+
+    // HT40 LDPC DATA: per symbol, map the coded chunk, apply the D_TM=6 tone map, emit.
+    const int htp40_base[6] = { 1, 1, 1, -1, -1, 1 };
+    for (int j = 0; j < N_sym; j++) {
+        vb chunk(coded.begin() + j * m.n_cbps, coded.begin() + (j + 1) * m.n_cbps);
+        vcf pts = ldpc_tone_map(map_qam(chunk, m.n_bpsc), d_tm);
+        float pol = POLARITY[(3 + j) % 127];
+        cf pil[6];
+        for (int i = 0; i < 6; i++)
+            pil[i] = cf(htp40_base[(i + j) % 6] * pol, 0);
+        append(frame, data_symbol40(pts, DSC, 7 + j, false, pil));
     }
     return { frame };
 }
@@ -1299,9 +1382,10 @@ std::vector<std::vector<cf>> build_frame(const uint8_t* psdu, int psdu_len,
     if (p.mcs > 7)
         throw std::runtime_error("wifi_tx: SISO MCS0-7 only (so far)");
     if (p.fec == TX_LDPC) {
-        if (p.format != TX_HT || p.bw != 20 || p.mcs > 7)
-            throw std::runtime_error("wifi_tx: LDPC only HT20 MCS0-7 (so far)");
-        return build_ht_ldpc(psdu, psdu_len, p);
+        if (p.format != TX_HT || (p.bw != 20 && p.bw != 40) || p.mcs > 7)
+            throw std::runtime_error("wifi_tx: LDPC only HT20/40 MCS0-7 (so far)");
+        return p.bw == 40 ? build_ht40_ldpc(psdu, psdu_len, p)
+                          : build_ht_ldpc(psdu, psdu_len, p);
     }
     if (p.fec != TX_BCC)
         throw std::runtime_error("wifi_tx: unknown FEC");
