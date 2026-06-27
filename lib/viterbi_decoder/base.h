@@ -37,6 +37,20 @@ public:
     ~base();
     virtual uint8_t* decode(ofdm_param* ofdm, frame_param* frame, uint8_t* in) = 0;
 
+    // Soft-decision decode (GR_SOFT_VITERBI). `in` carries one soft value per
+    // coded bit in [0, SOFT_Q]: 0 = confident bit 0, SOFT_Q = confident bit 1,
+    // SOFT_NEUTRAL = no information. A full-confidence soft input (q = bit ?
+    // SOFT_Q : 0) decodes identically to the hard decode(). Implemented here in
+    // the base (scalar) so it is independent of the hard SSE/generic path —
+    // the per-frame Viterbi cost makes SSE unnecessary for correctness.
+    uint8_t* decode_soft(ofdm_param* ofdm, frame_param* frame, uint8_t* in);
+
+    // Soft scale. SOFT_Q small keeps the metric in the uint8 accumulators with
+    // the existing per-output min-normalisation (no int16 repacking); 8-level
+    // soft already captures ~all of the soft-decision coding gain.
+    static const int SOFT_Q = 8;
+    static const int SOFT_NEUTRAL = SOFT_Q / 2;
+
 protected:
     // Position in circular buffer where the current decoded byte is stored
     int d_store_pos;
@@ -62,6 +76,28 @@ protected:
 
     virtual void reset() = 0;
     uint8_t* depuncture(uint8_t* in);
+
+    // Soft decoder state — scalar, independent of the derived hard decoder's
+    // branch table / metrics (so it works whether x86 or generic is compiled).
+    union soft_branchtab {
+        unsigned char c[32];
+    } d_soft_branchtab[2];
+    alignas(16) unsigned char d_soft_metric0[64];
+    alignas(16) unsigned char d_soft_metric1[64];
+    alignas(16) unsigned char d_soft_path0[64];
+    alignas(16) unsigned char d_soft_path1[64];
+
+    void soft_init();
+    uint8_t* depuncture_soft(uint8_t* in);
+    void soft_butterfly(unsigned char* symbols,
+                        unsigned char* mm0,
+                        unsigned char* mm1,
+                        unsigned char* pp0,
+                        unsigned char* pp1);
+    unsigned char soft_get_output(unsigned char* mm0,
+                                  unsigned char* pp0,
+                                  int ntraceback,
+                                  unsigned char* outbuf);
 };
 
 } // namespace ieee802_11
