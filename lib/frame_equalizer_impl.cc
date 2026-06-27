@@ -1064,6 +1064,12 @@ void frame_equalizer_impl::publish_pdu(const uint8_t* psdu, int len,
     pmt::pmt_t meta = pmt::make_dict();
     meta = pmt::dict_add(meta, pmt::mp("crc_ok"), pmt::from_bool(crc_ok));
     meta = pmt::dict_add(meta, pmt::mp("encoding"), pmt::from_uint64(encoding));
+    // SNR (L-LTF) + residual CFO, so a consumer can correlate decode failures
+    // with signal quality vs. impairment (a high-SNR FCS failure is a receiver
+    // correction defect, not noise).
+    meta = pmt::dict_add(meta, pmt::mp("snr"), pmt::from_double(d_equalizer->get_snr()));
+    meta = pmt::dict_add(meta, pmt::mp("freq_offset"),
+                         pmt::from_double(d_freq_offset_from_synclong));
     meta = pmt::dict_add(meta, pmt::mp("dlt"), pmt::from_long(105)); // LINKTYPE_IEEE802_11
     pmt::pmt_t blob = pmt::make_blob(psdu, len - 4); // strip FCS, like decode_mac
     message_port_pub(pmt::mp("pdu"), pmt::cons(meta, blob));
