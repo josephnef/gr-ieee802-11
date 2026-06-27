@@ -21,6 +21,7 @@
 
 #include <gnuradio/io_signature.h>
 #include <boost/crc.hpp>
+#include <cstdlib>
 #include <iomanip>
 
 using namespace gr::ieee802_11;
@@ -157,17 +158,30 @@ public:
         // skip service field
         boost::crc_32_type result;
         result.process_bytes(out_bytes + 2, d_frame.psdu_size);
-        if (result.checksum() != 558161692) {
+        const bool crc_ok = (result.checksum() == 558161692);
+
+        // GR_KEEP_CORRUPTED (mirror of devourer's DEVOURER_RX_KEEP_CORRUPTED):
+        // normally an FCS-failed frame is dropped here, hiding the
+        // mostly-correct bytes a fused-FEC sub-block-integrity layer could
+        // still salvage. With the env var set we publish the PSDU anyway,
+        // tagged crc_ok=#f, so the downstream SBI decoder can keep the
+        // surviving sub-blocks. Read once; default (unset) = unchanged.
+        static const bool keep_corrupted =
+            (std::getenv("GR_KEEP_CORRUPTED") != nullptr);
+        if (!crc_ok && !keep_corrupted) {
             dout << "checksum wrong -- dropping" << std::endl;
             return;
         }
 
-        mylog("encoding: {} - length: {} - symbols: {}",
+        mylog("encoding: {} - length: {} - symbols: {} - crc_ok: {}",
               d_ofdm.encoding,
               d_frame.psdu_size,
-              d_frame.n_sym);
+              d_frame.n_sym,
+              crc_ok);
 
-        // create PDU
+        // create PDU. crc_ok lets a consumer distinguish clean frames from
+        // kept-corrupt ones without re-checking the FCS itself.
+        d_meta = pmt::dict_add(d_meta, pmt::mp("crc_ok"), pmt::from_bool(crc_ok));
         pmt::pmt_t blob = pmt::make_blob(out_bytes + 2, d_frame.psdu_size - 4);
         d_meta =
             pmt::dict_add(d_meta, pmt::mp("dlt"), pmt::from_long(LINKTYPE_IEEE802_11));

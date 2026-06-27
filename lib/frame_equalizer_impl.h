@@ -121,6 +121,11 @@ private:
     void mimo_data_symbol(const gr_complex* r0, const gr_complex* r1, int sym_idx);
     void mimo_finish();
 
+    // Publish a decoded HT/VHT/MIMO PSDU on the "pdu" message port. `len`
+    // includes the 4-byte FCS. Honours GR_KEEP_CORRUPTED (mirror of decode_mac):
+    // surfaces FCS failures tagged crc_ok=#f for downstream fused-FEC salvage.
+    void publish_pdu(const uint8_t* psdu, int len, bool crc_ok, int encoding);
+
     // --- 802.11n HT STBC (1 spatial stream -> 2 space-time streams, Alamouti) ---
     // Detected when HT-SIG reports STBC=1 (SISO, 1 RX antenna). The 2 HT-LTF symbols
     // (P matrix) give the two STS channels h0,h1 on the single antenna; data OFDM
