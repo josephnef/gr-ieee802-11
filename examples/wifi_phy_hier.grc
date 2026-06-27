@@ -755,6 +755,7 @@ connections:
 - [fft_vxx_0_1, '0', ieee802_11_frame_equalizer_0, '0']
 - [ieee802_11_chunks_to_symbols_xx_0, '0', blocks_tagged_stream_mux_0, '1']
 - [ieee802_11_decode_mac_0, out, pad_sink_2, in]
+- [ieee802_11_frame_equalizer_0, pdu, pad_sink_2, in]
 - [ieee802_11_frame_equalizer_0, '0', ieee802_11_decode_mac_0, '0']
 - [ieee802_11_frame_equalizer_0, symbols, pad_sink_1, in]
 - [ieee802_11_mapper_0, '0', digital_packet_headergenerator_bb_0, '0']

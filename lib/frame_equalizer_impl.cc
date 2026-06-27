@@ -25,6 +25,7 @@
 #include "utils.h"
 #include <gnuradio/io_signature.h>
 #include <boost/crc.hpp>
+#include <cstdlib>
 #include <vector>
 
 namespace gr {
@@ -57,6 +58,7 @@ frame_equalizer_impl::frame_equalizer_impl(
 {
 
     message_port_register_out(pmt::mp("symbols"));
+    message_port_register_out(pmt::mp("pdu"));
 
     d_bpsk = constellation_bpsk::make();
     d_qpsk = constellation_qpsk::make();
@@ -969,6 +971,24 @@ void frame_equalizer_impl::ht_data_symbol(const gr_complex* raw, int sym_idx)
     }
 }
 
+void frame_equalizer_impl::publish_pdu(const uint8_t* psdu, int len,
+                                       bool crc_ok, int encoding)
+{
+    // HT/VHT/MIMO are decoded HERE (not in decode_mac), so the PDU delivery +
+    // GR_KEEP_CORRUPTED surfacing live here too. Read the env once; default
+    // (unset) drops FCS failures exactly as before — zero behaviour change.
+    static const bool keep = (std::getenv("GR_KEEP_CORRUPTED") != nullptr);
+    if (len < 4 || (!crc_ok && !keep)) {
+        return;
+    }
+    pmt::pmt_t meta = pmt::make_dict();
+    meta = pmt::dict_add(meta, pmt::mp("crc_ok"), pmt::from_bool(crc_ok));
+    meta = pmt::dict_add(meta, pmt::mp("encoding"), pmt::from_uint64(encoding));
+    meta = pmt::dict_add(meta, pmt::mp("dlt"), pmt::from_long(105)); // LINKTYPE_IEEE802_11
+    pmt::pmt_t blob = pmt::make_blob(psdu, len - 4); // strip FCS, like decode_mac
+    message_port_pub(pmt::mp("pdu"), pmt::cons(meta, blob));
+}
+
 void frame_equalizer_impl::ht_finish()
 {
     // LDPC path: the collected data bits (in tone order, no BCC interleave) hold one
@@ -1000,6 +1020,7 @@ void frame_equalizer_impl::ht_finish()
         bool lok = (lcrc.checksum() == 558161692);
         std::cout << "[LDPC-DATA] mcs=" << d_ht_mcs << " len=" << d_ht_len
                   << " (R1/2 n=648)  CRC-32 " << (lok ? "PASS" : "fail") << std::endl;
+        publish_pdu(lb + 2, d_ht_len, lok, gr::ieee802_11::HT_MCS_0 + d_ht_mcs);
         d_ht_fec = false;
         return;
     }
@@ -1063,6 +1084,7 @@ void frame_equalizer_impl::ht_finish()
                   << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
                   << std::endl;
     }
+    publish_pdu(out_bytes + 2, d_ht_len, ok, gr::ieee802_11::HT_MCS_0 + d_ht_mcs);
 }
 
 // ---- 802.11n 2x2 MIMO (MCS 8-15, HT20) ----------------------------------------
@@ -1228,6 +1250,8 @@ void frame_equalizer_impl::mimo_finish()
     std::cout << "[HT-MIMO] mcs=" << (d_ht_mcs + 8) << " (2x2) len=" << d_ht_len
               << " nsym=" << d_ht_nsym << "  CRC-32 " << (ok ? "PASS" : "fail")
               << std::endl;
+    publish_pdu(out_bytes + 2, d_ht_len, ok,
+                gr::ieee802_11::HT_MCS_0 + d_ht_mcs + 8);
 }
 
 // ---- 802.11n HT STBC (1 SS -> 2 STS Alamouti, HT20, 1 RX antenna) -------------
