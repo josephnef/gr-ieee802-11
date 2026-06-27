@@ -34,7 +34,12 @@ class decode_mac_impl : public decode_mac
 public:
     decode_mac_impl(bool log, bool debug)
         : block("decode_mac",
-                gr::io_signature::make(1, 1, 48),
+                // in0: 48 packed legacy symbol values (hard). in1 (OPTIONAL):
+                // per-coded-bit soft values from frame_equalizer for the
+                // GR_SOFT_VITERBI decode (same item rate; consumed in lockstep,
+                // used only when soft is on). Optional so existing single-input
+                // flowgraphs keep working untouched.
+                gr::io_signature::make2(1, 2, 48, LEGACY_SOFT_STRIDE),
                 gr::io_signature::make(0, 0, 0)),
           d_log(log),
           d_debug(debug),
@@ -52,6 +57,10 @@ public:
     {
 
         const uint8_t* in = (const uint8_t*)input_items[0];
+        // in1 (soft) is optional; present only when an upstream connects it.
+        const uint8_t* in_soft =
+            (input_items.size() > 1) ? (const uint8_t*)input_items[1] : nullptr;
+        d_soft_in_present = (in_soft != nullptr);
 
         int i = 0;
 
@@ -120,12 +129,17 @@ public:
                 dout << "copy one symbol, copied " << copied << " out of "
                      << d_frame.n_sym << std::endl;
                 std::memcpy(d_rx_symbols + (copied * 48), in, 48);
+                if (in_soft)
+                    std::memcpy(d_rx_soft_raw + (copied * LEGACY_SOFT_STRIDE),
+                                in_soft, LEGACY_SOFT_STRIDE);
                 copied++;
 
                 if (copied == d_frame.n_sym) {
                     dout << "received complete frame - decoding" << std::endl;
                     decode();
                     in += 48;
+                    if (in_soft)
+                        in_soft += LEGACY_SOFT_STRIDE;
                     i++;
                     d_frame_complete = true;
                     break;
@@ -133,10 +147,14 @@ public:
             }
 
             in += 48;
+            if (in_soft)
+                in_soft += LEGACY_SOFT_STRIDE;
             i++;
         }
 
         consume(0, i);
+        if (d_soft_in_present)
+            consume(1, i);
 
         return 0;
     }
@@ -144,14 +162,27 @@ public:
     void decode()
     {
 
-        for (int i = 0; i < d_frame.n_sym * 48; i++) {
-            for (int k = 0; k < d_ofdm.n_bpsc; k++) {
-                d_rx_bits[i * d_ofdm.n_bpsc + k] = !!(d_rx_symbols[i] & (1 << k));
+        // GR_SOFT_VITERBI: deinterleave the per-coded-bit soft values and run the
+        // soft Viterbi. Default (unset) keeps the hard unpack + decode bit-identical.
+        static const bool soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
+        const int n_cbps = d_ofdm.n_cbps; // = 48 * n_bpsc for legacy
+        uint8_t* decoded;
+        if (soft_on && d_soft_in_present) {
+            for (int s = 0; s < d_frame.n_sym; s++) {
+                std::memcpy(d_rx_soft + s * n_cbps,
+                            d_rx_soft_raw + s * LEGACY_SOFT_STRIDE, n_cbps);
             }
+            deinterleave(d_rx_soft, d_deinterleaved_soft);
+            decoded = d_decoder.decode_soft(&d_ofdm, &d_frame, d_deinterleaved_soft);
+        } else {
+            for (int i = 0; i < d_frame.n_sym * 48; i++) {
+                for (int k = 0; k < d_ofdm.n_bpsc; k++) {
+                    d_rx_bits[i * d_ofdm.n_bpsc + k] = !!(d_rx_symbols[i] & (1 << k));
+                }
+            }
+            deinterleave(d_rx_bits, d_deinterleaved_bits);
+            decoded = d_decoder.decode(&d_ofdm, &d_frame, d_deinterleaved_bits);
         }
-
-        deinterleave();
-        uint8_t* decoded = d_decoder.decode(&d_ofdm, &d_frame, d_deinterleaved_bits);
         descramble(decoded);
         print_output();
 
@@ -189,7 +220,9 @@ public:
         message_port_pub(pmt::mp("out"), pmt::cons(d_meta, blob));
     }
 
-    void deinterleave()
+    // Deinterleave src -> dst (one byte per coded bit). Used for both the hard
+    // bits and the GR_SOFT_VITERBI soft values (same permutation).
+    void deinterleave(const uint8_t* src, uint8_t* dst)
     {
 
         int n_cbps = d_ofdm.n_cbps;
@@ -205,11 +238,9 @@ public:
             second[i] = 16 * i - (n_cbps - 1) * int(floor(16.0 * i / n_cbps));
         }
 
-        int count = 0;
         for (int i = 0; i < d_frame.n_sym; i++) {
             for (int k = 0; k < n_cbps; k++) {
-                d_deinterleaved_bits[i * n_cbps + second[first[k]]] =
-                    d_rx_bits[i * n_cbps + k];
+                dst[i * n_cbps + second[first[k]]] = src[i * n_cbps + k];
             }
         }
     }
@@ -276,6 +307,12 @@ private:
     uint8_t d_rx_symbols[48 * MAX_SYM];
     uint8_t d_rx_bits[MAX_ENCODED_BITS];
     uint8_t d_deinterleaved_bits[MAX_ENCODED_BITS];
+    // GR_SOFT_VITERBI legacy path: per-coded-bit soft values (raw per-symbol from
+    // frame_equalizer's soft port, then packed + deinterleaved).
+    uint8_t d_rx_soft_raw[LEGACY_SOFT_STRIDE * MAX_SYM];
+    uint8_t d_rx_soft[MAX_ENCODED_BITS];
+    uint8_t d_deinterleaved_soft[MAX_ENCODED_BITS];
+    bool d_soft_in_present = false; // is the optional soft input connected?
     uint8_t out_bytes[MAX_PSDU_SIZE + 2]; // 2 for signal field
 
     int copied;

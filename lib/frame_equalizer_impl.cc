@@ -39,11 +39,21 @@ frame_equalizer::sptr frame_equalizer::make(
 }
 
 
+// Defined later in this file; forward-declared so the legacy soft demap in
+// general_work (above its definition) can call it.
+template <typename ConstSptr>
+static inline void soft_demap_points(const gr_complex& sym, const ConstSptr& mod,
+                                     int nbpsc, float scale, uint8_t* q_out);
+
 frame_equalizer_impl::frame_equalizer_impl(
     Equalizer algo, double freq, double bw, bool log, bool debug, int fft_len, int n_rx)
     : gr::block("frame_equalizer",
                 gr::io_signature::make(n_rx, n_rx, fft_len * sizeof(gr_complex)),
-                gr::io_signature::make(1, 1, 48)),
+                // out0: 48 packed legacy symbol values (hard path, unchanged).
+                // out1 (OPTIONAL): per-coded-bit soft values for decode_mac's
+                // GR_SOFT_VITERBI legacy decode, in lockstep with out0. Optional so
+                // existing single-output flowgraphs keep working untouched.
+                gr::io_signature::make2(1, 2, 48, LEGACY_SOFT_STRIDE)),
       d_current_symbol(0),
       d_log(log),
       d_debug(debug),
@@ -135,6 +145,11 @@ int frame_equalizer_impl::general_work(int noutput_items,
     const gr_complex* in = (const gr_complex*)input_items[0];
     const gr_complex* in1 = (d_n_rx == 2) ? (const gr_complex*)input_items[1] : nullptr;
     uint8_t* out = (uint8_t*)output_items[0];
+    // out1 (soft) is optional; only present when a downstream connects it.
+    uint8_t* out_soft = (output_items.size() > 1) ? (uint8_t*)output_items[1] : nullptr;
+    static const bool legacy_soft_on = std::getenv("GR_SOFT_VITERBI") != nullptr;
+    static const float legacy_soft_scale =
+        std::getenv("GR_SOFT_SCALE") ? (float)atof(std::getenv("GR_SOFT_SCALE")) : 8.0f;
 
     int i = 0;
     int o = 0;
@@ -259,6 +274,18 @@ int frame_equalizer_impl::general_work(int noutput_items,
         // do equalization
         d_equalizer->equalize(
             current_symbol, d_current_symbol, symbols, out + o * 48, d_frame_mod);
+
+        // GR_SOFT_VITERBI legacy path: per-coded-bit soft demap of the 48 data
+        // carriers from the equalized symbols, in lockstep with out0, so decode_mac
+        // can run the soft Viterbi. Garbage for non-data symbols is harmless
+        // (decode_mac reads only a frame's data symbols).
+        if (legacy_soft_on && out_soft) {
+            const int nbpsc = d_frame_mod->bits_per_symbol();
+            uint8_t* qs = out_soft + o * LEGACY_SOFT_STRIDE;
+            for (int c = 0; c < 48; c++)
+                soft_demap_points(symbols[c], d_frame_mod, nbpsc,
+                                  legacy_soft_scale, qs + c * nbpsc);
+        }
 
         // HT: once both candidate HT-SIG symbols are stashed, decode them off the
         // raw FFT (clean HT equalization) and, on a valid CRC-8, start the HT/MIMO
